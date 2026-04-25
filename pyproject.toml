@@ -14,9 +14,12 @@ authors = [
 
 [project.optional-dependencies]
 core = [
-  "tree-sitter",
+  "tree-sitter>=0.23.0",
+  "tree-sitter-python>=0.23.0",
   "neo4j",
   "pydantic>=2",
+  "pydantic-settings>=2.3.0",
+  "python-dotenv>=1.0.0",
   "fastapi",
   "uvicorn[standard]"
 ]
