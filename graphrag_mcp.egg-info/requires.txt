@@ -1,0 +1,13 @@
+
+[core]
+tree-sitter
+neo4j
+pydantic>=2
+fastapi
+uvicorn[standard]
+
+[dev]
+ruff
+
+[test]
+pytest

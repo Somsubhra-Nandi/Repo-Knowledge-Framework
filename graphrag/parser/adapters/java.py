@@ -1,0 +1,2 @@
+"""Java adapter scaffold."""
+

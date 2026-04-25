@@ -1,0 +1,2 @@
+"""Schema model scaffold."""
+

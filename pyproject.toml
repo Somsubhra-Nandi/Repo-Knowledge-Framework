@@ -1,0 +1,42 @@
+[build-system]
+requires = ["setuptools>=68", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "graphrag-mcp"
+version = "0.1.0"
+description = "Polyglot GraphRAG MCP server scaffold"
+readme = "README.md"
+requires-python = ">=3.12"
+authors = [
+  { name = "Core Developer Team" }
+]
+
+[project.optional-dependencies]
+core = [
+  "tree-sitter",
+  "neo4j",
+  "pydantic>=2",
+  "fastapi",
+  "uvicorn[standard]"
+]
+dev = [
+  "ruff"
+]
+test = [
+  "pytest"
+]
+
+[project.scripts]
+graphrag = "graphrag.cli:main"
+
+[tool.setuptools]
+include-package-data = true
+
+[tool.setuptools.packages.find]
+where = ["."]
+include = ["graphrag*"]
+
+[tool.ruff]
+line-length = 100
+target-version = "py312"

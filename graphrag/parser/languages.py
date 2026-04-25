@@ -1,0 +1,2 @@
+"""Language map scaffold."""
+

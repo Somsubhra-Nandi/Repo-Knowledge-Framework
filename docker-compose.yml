@@ -1,0 +1,44 @@
+services:
+  neo4j:
+    image: neo4j:5
+    container_name: graphrag-neo4j
+    restart: unless-stopped
+    ports:
+      - "7474:7474"
+      - "7687:7687"
+    environment:
+      NEO4J_AUTH: "${NEO4J_USERNAME:-neo4j}/${NEO4J_PASSWORD:-neo4j_password}"
+    volumes:
+      - neo4j_data:/data
+      - neo4j_logs:/logs
+    networks:
+      - graphrag-net
+
+  app:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    container_name: graphrag-app
+    restart: unless-stopped
+    env_file:
+      - .env
+    environment:
+      NEO4J_URI: "${NEO4J_URI:-bolt://neo4j:7687}"
+    volumes:
+      - ./:/workspace
+    working_dir: /workspace
+    command: uvicorn graphrag.api:app --host 0.0.0.0 --port 8000 --reload
+    ports:
+      - "8000:8000"
+    depends_on:
+      - neo4j
+    networks:
+      - graphrag-net
+
+volumes:
+  neo4j_data:
+  neo4j_logs:
+
+networks:
+  graphrag-net:
+    name: graphrag-net
