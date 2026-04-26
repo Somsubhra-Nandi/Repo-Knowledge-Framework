@@ -6,6 +6,8 @@ from datetime import UTC, datetime
 from dotenv import load_dotenv
 from neo4j import Driver, GraphDatabase, Transaction
 
+from graphrag.graph.repo_index import RepoIndex
+from graphrag.graph.resolver import CallResolver
 from graphrag.parser.factory import CallInfo, ParsedFile
 from graphrag.schema.models import ClassNode, MethodNode
 
@@ -15,13 +17,25 @@ load_dotenv()
 class Neo4jWriter:
     """Persist parsed file structures into Neo4j."""
 
-    def __init__(self, uri: str, username: str, password: str) -> None:
+    def __init__(
+        self,
+        uri: str,
+        username: str,
+        password: str,
+        repo_index: RepoIndex | None = None,
+    ) -> None:
         self._driver: Driver = GraphDatabase.driver(uri, auth=(username, password))
         self._repo_prefix = os.getenv("REPO_ROOT_PATH", "").replace("\\", "/").strip("./").replace("/", ".")
+        self._repo_index = repo_index or RepoIndex()
 
     def ingest_file(self, parsed_file: ParsedFile) -> None:
         """Write the complete hierarchy for one parsed file into Neo4j."""
-        all_fqns = {method.fqn for method in parsed_file.methods}
+        self._repo_index.register_file(parsed_file)
+        import_map = self._repo_index.build_import_map(parsed_file)
+        resolver = CallResolver(
+            known_fqns=self._repo_index.all_fqns,
+            import_map=import_map,
+        )
 
         with self._driver.session() as session:
             with session.begin_transaction() as tx:
@@ -66,7 +80,7 @@ class Neo4jWriter:
                         tx=tx,
                         method_fqn=method.fqn,
                         calls=method.calls,
-                        all_fqns=all_fqns,
+                        resolver=resolver,
                     )
 
                 self._write_imports(tx, parsed_file)
@@ -187,36 +201,29 @@ class Neo4jWriter:
             fqn=method_node.fqn,
         )
 
-    def _resolve_callee(self, callee_name: str, all_fqns: set[str]) -> tuple[str, float, bool]:
-        candidates = [fqn for fqn in all_fqns if fqn.endswith(callee_name)]
-        if candidates:
-            return candidates[0], 1.0, True
-        return f"unresolved.{callee_name}", 0.2, False
-
     def _write_call_edges(
         self,
         tx: Transaction,
         method_fqn: str,
         calls: list[CallInfo],
-        all_fqns: set[str],
+        resolver: CallResolver,
     ) -> None:
         for call in calls:
-            callee_fqn, confidence, resolved = self._resolve_callee(call.callee_name, all_fqns)
+            resolved_call = resolver.resolve(callee_name=call.callee_name, line=call.line)
             tx.run(
                 """
                 MERGE (caller:Method {fqn: $caller_fqn})
                 MERGE (callee:Method {fqn: $callee_fqn})
-                MERGE (caller)-[:CALLS {
-                    line: $line,
-                    confidence: $confidence,
-                    resolved: $resolved
-                }]->(callee)
+                MERGE (caller)-[r:CALLS]->(callee)
+                SET r.line = $line,
+                    r.confidence = $confidence,
+                    r.resolved = $resolved
                 """,
                 caller_fqn=method_fqn,
-                callee_fqn=callee_fqn,
-                line=call.line,
-                confidence=confidence,
-                resolved=resolved,
+                callee_fqn=resolved_call.callee_fqn,
+                line=resolved_call.line,
+                confidence=resolved_call.confidence,
+                resolved=resolved_call.resolved,
             )
 
     def _parse_import_entry(self, import_text: str) -> tuple[str, list[str]]:
