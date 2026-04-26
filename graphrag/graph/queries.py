@@ -10,6 +10,7 @@ def create_indexes(driver: Driver) -> None:
         "CREATE INDEX IF NOT EXISTS FOR (c:Class) ON (c.fqn)",
         "CREATE INDEX IF NOT EXISTS FOR (m:Method) ON (m.fqn)",
         "CREATE INDEX IF NOT EXISTS FOR (f:Folder) ON (f.path)",
+        "CREATE INDEX IF NOT EXISTS FOR (e:Endpoint) ON (e.path)",
         "CREATE CONSTRAINT IF NOT EXISTS FOR (m:Method) REQUIRE m.fqn IS UNIQUE",
         "CREATE CONSTRAINT IF NOT EXISTS FOR (c:Class) REQUIRE c.fqn IS UNIQUE",
     ]
