@@ -45,6 +45,7 @@ class MethodNode(BaseModel):
     line: int
     signature: str
     language: str
+    source_code: str = ""
     is_dynamic: bool = False
 
     model_config = ConfigDict(frozen=True)
