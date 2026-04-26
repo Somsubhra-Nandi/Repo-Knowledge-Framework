@@ -6,10 +6,12 @@ from datetime import UTC, datetime
 from dotenv import load_dotenv
 from neo4j import Driver, GraphDatabase, Transaction
 
+from graphrag.graph.endpoint_extractor import extract_endpoints
 from graphrag.graph.repo_index import RepoIndex
+from graphrag.graph.route_call_extractor import RouteCall, extract_route_calls
 from graphrag.graph.resolver import CallResolver
 from graphrag.parser.factory import CallInfo, ParsedFile
-from graphrag.schema.models import ClassNode, MethodNode
+from graphrag.schema.models import ClassNode, EndpointNode, MethodNode
 
 load_dotenv()
 
@@ -84,6 +86,12 @@ class Neo4jWriter:
                     )
 
                 self._write_imports(tx, parsed_file)
+                endpoints = extract_endpoints(parsed_file)
+                for endpoint in endpoints:
+                    self._write_endpoint(tx, endpoint)
+                route_calls = extract_route_calls(parsed_file)
+                for route_call in route_calls:
+                    self._write_route_call(tx, route_call)
                 tx.commit()
 
     def close(self) -> None:
@@ -268,4 +276,48 @@ class Neo4jWriter:
                     target_path=target_path,
                     symbols=symbols,
                 )
+
+    def _write_endpoint(self, tx: Transaction, endpoint: EndpointNode) -> None:
+        tx.run(
+            """
+            MERGE (e:Endpoint {path: $path, http_method: $http_method})
+            SET e.handler_fqn = $handler_fqn,
+                e.language = $language,
+                e.file = $file,
+                e.line = $line
+            WITH e
+            MATCH (m:Method {fqn: $handler_fqn})
+            MERGE (m)-[:HANDLES]->(e)
+            """,
+            path=endpoint.path,
+            http_method=endpoint.http_method,
+            handler_fqn=endpoint.handler_fqn,
+            language=endpoint.language,
+            file=endpoint.file,
+            line=endpoint.line,
+        )
+
+    def _write_route_call(self, tx: Transaction, route_call: RouteCall) -> None:
+        """Store a detected frontend API call as a RouteCall node in Neo4j."""
+        tx.run(
+            """
+            MERGE (rc:RouteCall {
+                source_method_fqn: $source_method_fqn,
+                path: $path,
+                http_method: $http_method
+            })
+            SET rc.confidence = $confidence,
+                rc.line = $line,
+                rc.source_file = $source_file
+            WITH rc
+            MATCH (m:Method {fqn: $source_method_fqn})
+            MERGE (m)-[:MAKES_CALL]->(rc)
+            """,
+            source_method_fqn=route_call.source_method_fqn,
+            path=route_call.path,
+            http_method=route_call.http_method,
+            confidence=route_call.confidence,
+            line=route_call.line,
+            source_file=route_call.source_file,
+        )
 
