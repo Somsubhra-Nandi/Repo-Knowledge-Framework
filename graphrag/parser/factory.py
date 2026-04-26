@@ -322,6 +322,234 @@ def _extract_java_package(root_node: Node, source: bytes) -> str:
     return ""
 
 
+def _extract_go_package(root_node: Node, source: bytes) -> str:
+    """Extract the Go package name from the root AST node."""
+    for child in root_node.children:
+        if child.type == "package_clause":
+            name_node = child.child_by_field_name("name")
+            if name_node is not None:
+                return _node_text(source, name_node).strip()
+            declaration = _node_text(source, child).strip()
+            if declaration.startswith("package "):
+                return declaration[len("package ") :].strip()
+    return ""
+
+
+def _extract_go_receiver_type(source: bytes, receiver_node: Node | None) -> str | None:
+    """Extract receiver type name from a Go method receiver declaration."""
+    if receiver_node is None:
+        return None
+
+    for child in receiver_node.children:
+        if child.type != "parameter_declaration":
+            continue
+        type_node = child.child_by_field_name("type")
+        if type_node is None:
+            continue
+        receiver_type = _node_text(source, type_node).strip().replace("*", "").strip()
+        if "." in receiver_type:
+            receiver_type = receiver_type.split(".")[-1]
+        if receiver_type:
+            return receiver_type
+
+    candidates: list[str] = []
+    for child in receiver_node.children:
+        if child.type in {"identifier", "type_identifier", "qualified_type"}:
+            candidates.append(_node_text(source, child).strip())
+        if child.type == "parameter_declaration":
+            for parameter_child in child.children:
+                if parameter_child.type in {"identifier", "type_identifier", "qualified_type"}:
+                    candidates.append(_node_text(source, parameter_child).strip())
+
+    if len(candidates) >= 2:
+        receiver_type = candidates[1]
+    elif candidates:
+        receiver_type = candidates[-1]
+    else:
+        receiver_type = _node_text(source, receiver_node).strip()
+
+    receiver_type = receiver_type.replace("*", "").strip()
+    if "." in receiver_type:
+        receiver_type = receiver_type.split(".")[-1]
+    if receiver_type.startswith("(") and receiver_type.endswith(")"):
+        receiver_type = receiver_type[1:-1].strip()
+    return receiver_type or None
+
+
+def _extract_go_signature(source: bytes, node: Node, method_name: str) -> str:
+    """Build a signature-like string for Go functions and methods."""
+    parameters_node = node.child_by_field_name("parameters")
+    parameters = _node_text(source, parameters_node) if parameters_node is not None else "()"
+    result_node = node.child_by_field_name("result")
+    result = f" {_node_text(source, result_node).strip()}" if result_node is not None else ""
+    receiver_node = node.child_by_field_name("receiver")
+    if receiver_node is not None:
+        receiver = _node_text(source, receiver_node).strip()
+        return f"func {receiver} {method_name}{parameters}{result}"
+    return f"func {method_name}{parameters}{result}"
+
+
+def _collect_go_definitions(
+    node: Node,
+    source: bytes,
+    module_name: str,
+    classes: list[ClassInfo],
+    methods: list[MethodInfo],
+    imports: list[str],
+    class_lookup: dict[str, ClassInfo],
+) -> None:
+    """Walk a Go tree and collect structs, interfaces, functions, methods, and imports."""
+    if node.type == "import_declaration":
+        imports.append(_node_text(source, node).strip())
+    elif node.type == "import_spec":
+        imports.append(_node_text(source, node).strip())
+    elif node.type == "type_spec":
+        value_node = node.child_by_field_name("type")
+        if value_node is not None and value_node.type in {"struct_type", "interface_type"}:
+            class_name = _find_identifier_text(source, node)
+            class_info = ClassInfo(
+                name=class_name,
+                line=node.start_point[0] + 1,
+                methods=[],
+                fqn=build_fqn(module_name, class_name),
+            )
+            classes.append(class_info)
+            class_lookup[class_name] = class_info
+    elif node.type == "function_declaration":
+        method_name = _find_identifier_text(source, node)
+        methods.append(
+            MethodInfo(
+                name=method_name,
+                line=node.start_point[0] + 1,
+                class_name=None,
+                fqn=build_fqn(module_name, method_name),
+                signature=_extract_go_signature(source, node, method_name),
+                source_code=_node_text(source, node),
+                calls=_collect_call_expressions(source, node),
+            )
+        )
+    elif node.type == "method_declaration":
+        method_name = _find_identifier_text(source, node)
+        class_name = _extract_go_receiver_type(source, node.child_by_field_name("receiver"))
+        method_fqn = (
+            build_fqn(module_name, class_name, method_name)
+            if class_name is not None
+            else build_fqn(module_name, method_name)
+        )
+        methods.append(
+            MethodInfo(
+                name=method_name,
+                line=node.start_point[0] + 1,
+                class_name=class_name,
+                fqn=method_fqn,
+                signature=_extract_go_signature(source, node, method_name),
+                source_code=_node_text(source, node),
+                calls=_collect_call_expressions(source, node),
+            )
+        )
+        if class_name is not None and class_name in class_lookup:
+            class_lookup[class_name].methods.append(method_name)
+
+    for child in node.children:
+        _collect_go_definitions(
+            node=child,
+            source=source,
+            module_name=module_name,
+            classes=classes,
+            methods=methods,
+            imports=imports,
+            class_lookup=class_lookup,
+        )
+
+
+def _extract_rust_signature(source: bytes, node: Node, function_name: str) -> str:
+    """Build a signature-like string for Rust functions and methods."""
+    parameters_node = node.child_by_field_name("parameters")
+    parameters = _node_text(source, parameters_node) if parameters_node is not None else "()"
+    return_type_node = node.child_by_field_name("return_type")
+    if return_type_node is not None:
+        return f"fn {function_name}{parameters} {_node_text(source, return_type_node).strip()}"
+    return f"fn {function_name}{parameters}"
+
+
+def _extract_rust_impl_type(source: bytes, impl_node: Node) -> str | None:
+    """Extract concrete impl type name from a Rust impl block."""
+    type_node = impl_node.child_by_field_name("type")
+    if type_node is None:
+        return None
+    type_text = _node_text(source, type_node).strip()
+    if "<" in type_text:
+        type_text = type_text.split("<", maxsplit=1)[0].strip()
+    if "::" in type_text:
+        type_text = type_text.split("::")[-1].strip()
+    return type_text or None
+
+
+def _collect_rust_definitions(
+    node: Node,
+    source: bytes,
+    module_name: str,
+    classes: list[ClassInfo],
+    methods: list[MethodInfo],
+    imports: list[str],
+    class_lookup: dict[str, ClassInfo],
+) -> None:
+    """Walk a Rust tree and collect structs, traits, enums, functions, methods, and imports."""
+    if node.type == "use_declaration":
+        imports.append(_node_text(source, node).strip())
+    elif node.type in {"struct_item", "trait_item", "enum_item"}:
+        class_name = _find_identifier_text(source, node)
+        class_info = ClassInfo(
+            name=class_name,
+            line=node.start_point[0] + 1,
+            methods=[],
+            fqn=build_fqn(module_name, class_name),
+        )
+        classes.append(class_info)
+        class_lookup[class_name] = class_info
+    elif node.type == "function_item":
+        function_name = _find_identifier_text(source, node)
+        class_name: str | None = None
+        parent = node.parent
+        if (
+            parent is not None
+            and parent.type == "declaration_list"
+            and parent.parent is not None
+            and parent.parent.type == "impl_item"
+        ):
+            class_name = _extract_rust_impl_type(source, parent.parent)
+
+        method_fqn = (
+            build_fqn(module_name, class_name, function_name)
+            if class_name is not None
+            else build_fqn(module_name, function_name)
+        )
+        methods.append(
+            MethodInfo(
+                name=function_name,
+                line=node.start_point[0] + 1,
+                class_name=class_name,
+                fqn=method_fqn,
+                signature=_extract_rust_signature(source, node, function_name),
+                source_code=_node_text(source, node),
+                calls=_collect_call_expressions(source, node),
+            )
+        )
+        if class_name is not None and class_name in class_lookup:
+            class_lookup[class_name].methods.append(function_name)
+
+    for child in node.children:
+        _collect_rust_definitions(
+            node=child,
+            source=source,
+            module_name=module_name,
+            classes=classes,
+            methods=methods,
+            imports=imports,
+            class_lookup=class_lookup,
+        )
+
+
 def _extract_java_annotations(source: bytes, node: Node) -> str:
     """Collect annotation text directly attached to a Java declaration node."""
     annotations: list[str] = []
@@ -467,6 +695,28 @@ def parse_file(file_path: str) -> ParsedFile:
             node=tree.root_node,
             source=source_bytes,
             module_name=effective_module,
+            classes=classes,
+            methods=methods,
+            imports=imports,
+            class_lookup=class_lookup,
+        )
+    elif language_name == "go":
+        go_package = _extract_go_package(tree.root_node, source_bytes)
+        effective_module = go_package if go_package else module_name
+        _collect_go_definitions(
+            node=tree.root_node,
+            source=source_bytes,
+            module_name=effective_module,
+            classes=classes,
+            methods=methods,
+            imports=imports,
+            class_lookup=class_lookup,
+        )
+    elif language_name == "rust":
+        _collect_rust_definitions(
+            node=tree.root_node,
+            source=source_bytes,
+            module_name=module_name,
             classes=classes,
             methods=methods,
             imports=imports,
