@@ -105,12 +105,23 @@ def _collect_call_expressions(source: bytes, function_node: Node) -> list[CallIn
 
     while stack:
         current = stack.pop()
-        if current.type in {"call_expression", "call"}:
+        if current.type in {"call_expression", "call", "method_invocation"}:
+            callee_name = ""
             function_part = current.child_by_field_name("function")
             if function_part is not None:
+                callee_name = _node_text(source, function_part).strip()
+            elif current.type == "method_invocation":
+                object_part = current.child_by_field_name("object")
+                name_part = current.child_by_field_name("name")
+                if object_part is not None and name_part is not None:
+                    callee_name = f"{_node_text(source, object_part).strip()}.{_node_text(source, name_part).strip()}"
+                elif name_part is not None:
+                    callee_name = _node_text(source, name_part).strip()
+
+            if callee_name:
                 calls.append(
                     CallInfo(
-                        callee_name=_node_text(source, function_part).strip(),
+                        callee_name=callee_name,
                         line=current.start_point[0] + 1,
                     )
                 )
@@ -298,6 +309,118 @@ def _collect_typescript_definitions(
         )
 
 
+def _extract_java_package(root_node: Node, source: bytes) -> str:
+    """Extract the Java package name from the root AST node."""
+    for child in root_node.children:
+        if child.type == "package_declaration":
+            declaration = _node_text(source, child).strip()
+            if declaration.startswith("package "):
+                declaration = declaration[len("package ") :]
+            if declaration.endswith(";"):
+                declaration = declaration[:-1]
+            return declaration.strip()
+    return ""
+
+
+def _extract_java_annotations(source: bytes, node: Node) -> str:
+    """Collect annotation text directly attached to a Java declaration node."""
+    annotations: list[str] = []
+    for child in node.children:
+        if child.type in {"marker_annotation", "annotation"}:
+            annotations.append(_node_text(source, child).strip())
+        elif child.type == "modifiers":
+            for modifier_child in child.children:
+                if modifier_child.type in {"marker_annotation", "annotation"}:
+                    annotations.append(_node_text(source, modifier_child).strip())
+    return " ".join(annotations)
+
+
+def _extract_java_method_signature(source: bytes, node: Node, name: str) -> str:
+    """Build a method signature string for Java methods and constructors."""
+    annotations = _extract_java_annotations(source, node)
+    parameters_node = node.child_by_field_name("parameters")
+    parameters = _node_text(source, parameters_node) if parameters_node is not None else "()"
+
+    if node.type == "constructor_declaration":
+        base_signature = f"{name}{parameters}"
+    else:
+        return_type_node = node.child_by_field_name("type")
+        return_type = _node_text(source, return_type_node).strip() if return_type_node is not None else ""
+        base_signature = f"{name}{parameters}"
+        if return_type:
+            base_signature = f"{base_signature}: {return_type}"
+
+    if annotations:
+        return f"{annotations} {base_signature}"
+    return base_signature
+
+
+def _get_enclosing_java_class(source: bytes, node: Node) -> str | None:
+    """Return enclosing Java class/interface/enum name if present."""
+    current = node.parent
+    while current is not None:
+        if current.type in {"class_declaration", "interface_declaration", "enum_declaration"}:
+            return _find_identifier_text(source, current)
+        current = current.parent
+    return None
+
+
+def _collect_java_definitions(
+    node: Node,
+    source: bytes,
+    module_name: str,
+    classes: list[ClassInfo],
+    methods: list[MethodInfo],
+    imports: list[str],
+    class_lookup: dict[str, ClassInfo],
+) -> None:
+    """Walk a Java tree and collect classes, methods, constructors, and imports."""
+    if node.type == "import_declaration":
+        imports.append(_node_text(source, node).strip())
+    elif node.type in {"class_declaration", "interface_declaration", "enum_declaration"}:
+        class_name = _find_identifier_text(source, node)
+        class_info = ClassInfo(
+            name=class_name,
+            line=node.start_point[0] + 1,
+            methods=[],
+            fqn=build_fqn(module_name, class_name),
+        )
+        classes.append(class_info)
+        class_lookup[class_name] = class_info
+    elif node.type in {"method_declaration", "constructor_declaration"}:
+        method_name = _find_identifier_text(source, node)
+        class_name = _get_enclosing_java_class(source, node)
+        method_fqn = (
+            build_fqn(module_name, class_name, method_name)
+            if class_name is not None
+            else build_fqn(module_name, method_name)
+        )
+        methods.append(
+            MethodInfo(
+                name=method_name,
+                line=node.start_point[0] + 1,
+                class_name=class_name,
+                fqn=method_fqn,
+                signature=_extract_java_method_signature(source, node, method_name),
+                source_code=_node_text(source, node),
+                calls=_collect_call_expressions(source, node),
+            )
+        )
+        if class_name is not None and class_name in class_lookup:
+            class_lookup[class_name].methods.append(method_name)
+
+    for child in node.children:
+        _collect_java_definitions(
+            node=child,
+            source=source,
+            module_name=module_name,
+            classes=classes,
+            methods=methods,
+            imports=imports,
+            class_lookup=class_lookup,
+        )
+
+
 def parse_file(file_path: str) -> ParsedFile:
     """Parse a single source file into structured metadata."""
     parser = get_parser(file_path)
@@ -332,6 +455,18 @@ def parse_file(file_path: str) -> ParsedFile:
             node=tree.root_node,
             source=source_bytes,
             module_name=module_name,
+            classes=classes,
+            methods=methods,
+            imports=imports,
+            class_lookup=class_lookup,
+        )
+    elif language_name == "java":
+        java_package = _extract_java_package(tree.root_node, source_bytes)
+        effective_module = java_package if java_package else module_name
+        _collect_java_definitions(
+            node=tree.root_node,
+            source=source_bytes,
+            module_name=effective_module,
             classes=classes,
             methods=methods,
             imports=imports,
