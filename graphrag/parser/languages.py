@@ -2,6 +2,7 @@
 
 from tree_sitter import Language
 from tree_sitter_javascript import language as javascript_language
+from tree_sitter_java import language as java_language
 from tree_sitter_python import language as python_language
 from tree_sitter_typescript import language_tsx, language_typescript
 
@@ -11,6 +12,7 @@ EXT_MAP: dict[str, str] = {
     ".tsx": "typescript",
     ".js": "javascript",
     ".jsx": "javascript",
+    ".java": "java",
 }
 
 
@@ -24,6 +26,8 @@ def load_language(lang_name: str, extension: str | None = None) -> Language:
         return Language(language_typescript())
     if lang_name == "javascript":
         return Language(javascript_language())
+    if lang_name == "java":
+        return Language(java_language())
 
     raise ValueError(f"Unsupported language: {lang_name}")
 
