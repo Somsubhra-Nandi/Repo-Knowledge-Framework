@@ -1,11 +1,21 @@
 """Parser factory and language-specific file parsing."""
 
+import hashlib
 from dataclasses import dataclass
 from pathlib import Path
 
 from tree_sitter import Node, Parser
 
 from graphrag.parser.languages import EXT_MAP, load_language
+from graphrag.schema.models import build_fqn
+
+
+@dataclass
+class CallInfo:
+    """A function call found inside a method body."""
+
+    callee_name: str
+    line: int
 
 
 @dataclass
@@ -15,6 +25,7 @@ class ClassInfo:
     name: str
     line: int
     methods: list[str]
+    fqn: str
 
 
 @dataclass
@@ -24,6 +35,18 @@ class MethodInfo:
     name: str
     line: int
     class_name: str | None
+    fqn: str
+    signature: str
+    source_code: str
+    calls: list[CallInfo]
+
+
+@dataclass
+class FolderNode:
+    """Folder information for the parsed source file."""
+
+    path: str
+    name: str
 
 
 @dataclass
@@ -35,6 +58,9 @@ class ParsedFile:
     classes: list[ClassInfo]
     methods: list[MethodInfo]
     imports: list[str]
+    folder: FolderNode
+    module_name: str
+    checksum: str
 
 
 def get_parser(file_path: str) -> Parser:
@@ -62,9 +88,42 @@ def _find_identifier_text(source: bytes, node: Node) -> str:
     return _node_text(source, name_node)
 
 
+def _extract_signature(source: bytes, node: Node) -> str:
+    """Build a best-effort Python function signature text ending with ':'."""
+    method_name = _find_identifier_text(source, node)
+    parameters_node = node.child_by_field_name("parameters")
+    parameters = _node_text(source, parameters_node) if parameters_node is not None else "()"
+    return_type_node = node.child_by_field_name("return_type")
+    return_type = f" -> {_node_text(source, return_type_node)}" if return_type_node is not None else ""
+    return f"def {method_name}{parameters}{return_type}:"
+
+
+def _collect_call_expressions(source: bytes, function_node: Node) -> list[CallInfo]:
+    """Collect call expressions contained within a function definition."""
+    calls: list[CallInfo] = []
+    stack: list[Node] = [function_node]
+
+    while stack:
+        current = stack.pop()
+        if current.type == "call_expression":
+            function_part = current.child_by_field_name("function")
+            if function_part is not None:
+                calls.append(
+                    CallInfo(
+                        callee_name=_node_text(source, function_part).strip(),
+                        line=current.start_point[0] + 1,
+                    )
+                )
+        for child in current.children:
+            stack.append(child)
+
+    return calls
+
+
 def _collect_python_definitions(
     node: Node,
     source: bytes,
+    module_name: str,
     classes: list[ClassInfo],
     methods: list[MethodInfo],
     imports: list[str],
@@ -79,6 +138,7 @@ def _collect_python_definitions(
             name=class_name,
             line=node.start_point[0] + 1,
             methods=[],
+            fqn=build_fqn(module_name, class_name),
         )
         classes.append(class_info)
         class_lookup[class_name] = class_info
@@ -94,10 +154,19 @@ def _collect_python_definitions(
         ):
             class_name = _find_identifier_text(source, parent.parent)
 
+        method_fqn = (
+            build_fqn(module_name, class_name, method_name)
+            if class_name is not None
+            else build_fqn(module_name, method_name)
+        )
         method_info = MethodInfo(
             name=method_name,
             line=node.start_point[0] + 1,
             class_name=class_name,
+            fqn=method_fqn,
+            signature=_extract_signature(source, node),
+            source_code=_node_text(source, node),
+            calls=_collect_call_expressions(source, node),
         )
         methods.append(method_info)
         if class_name is not None:
@@ -107,6 +176,7 @@ def _collect_python_definitions(
         _collect_python_definitions(
             node=child,
             source=source,
+            module_name=module_name,
             classes=classes,
             methods=methods,
             imports=imports,
@@ -122,16 +192,22 @@ def parse_file(file_path: str) -> ParsedFile:
 
     source_bytes = Path(file_path).read_bytes()
     tree = parser.parse(source_bytes)
+    file_path_obj = Path(file_path)
 
     classes: list[ClassInfo] = []
     methods: list[MethodInfo] = []
     imports: list[str] = []
     class_lookup: dict[str, ClassInfo] = {}
+    checksum = hashlib.sha256(source_bytes).hexdigest()
+    folder_path = file_path_obj.parent.as_posix()
+    folder = FolderNode(path=folder_path, name=file_path_obj.parent.name)
+    module_name = file_path_obj.with_suffix("").as_posix().replace("/", ".")
 
     if language_name == "python":
         _collect_python_definitions(
             node=tree.root_node,
             source=source_bytes,
+            module_name=module_name,
             classes=classes,
             methods=methods,
             imports=imports,
@@ -144,5 +220,8 @@ def parse_file(file_path: str) -> ParsedFile:
         classes=classes,
         methods=methods,
         imports=imports,
+        folder=folder,
+        module_name=module_name,
+        checksum=checksum,
     )
 
