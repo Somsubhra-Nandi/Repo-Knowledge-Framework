@@ -10,6 +10,7 @@ from time import perf_counter
 from neo4j import GraphDatabase
 
 from graphrag.graph.repo_index import RepoIndex
+from graphrag.graph.stitch import RouteStitcher
 from graphrag.graph.writer import Neo4jWriter
 from graphrag.ingestion.walker import RepoWalker
 from graphrag.parser.factory import ParsedFile, parse_file
@@ -23,6 +24,7 @@ class IngestionResult:
     failed: int
     errors: list[str]
     duration_seconds: float
+    routes_stitched: int = 0
 
 
 class IngestionPipeline:
@@ -103,6 +105,25 @@ class IngestionPipeline:
         finally:
             writer.close()
 
+        print("[graphrag] Stitching frontend calls to backend endpoints...")
+        stitcher = RouteStitcher(
+            uri=self._uri,
+            username=self._username,
+            password=self._password,
+        )
+        routes_stitched = 0
+        try:
+            stitch_result = stitcher.stitch()
+            routes_stitched = stitch_result.total_edges_created
+            print(
+                f"[graphrag] Stitch complete. "
+                f"{stitch_result.exact_matches} exact, "
+                f"{stitch_result.param_matches} parameterized, "
+                f"{stitch_result.unmatched_calls} unmatched"
+            )
+        finally:
+            stitcher.close()
+
         duration_seconds = perf_counter() - started_at
         failed = len(errors)
         print(
@@ -116,6 +137,7 @@ class IngestionPipeline:
             failed=failed,
             errors=errors,
             duration_seconds=duration_seconds,
+            routes_stitched=routes_stitched,
         )
 
     def _compute_file_checksum(self, file_path: str) -> str:
