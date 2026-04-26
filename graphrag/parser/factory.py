@@ -105,7 +105,7 @@ def _collect_call_expressions(source: bytes, function_node: Node) -> list[CallIn
 
     while stack:
         current = stack.pop()
-        if current.type == "call_expression":
+        if current.type in {"call_expression", "call"}:
             function_part = current.child_by_field_name("function")
             if function_part is not None:
                 calls.append(
