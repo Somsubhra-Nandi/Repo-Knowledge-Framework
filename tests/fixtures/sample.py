@@ -4,18 +4,18 @@ from pathlib import Path
 
 class Alpha:
     def method_one(self) -> str:
-        return "alpha"
+        return top_level_one()
 
     def method_two(self, value: int) -> int:
-        return value + 1
+        return self.method_one().count("a") + value + top_level_two(1)
 
 
 class Beta:
     def run(self) -> bool:
-        return True
+        return bool(os.path.basename(Path("run").as_posix()))
 
     def stop(self) -> bool:
-        return False
+        return bool(self.run())
 
 
 def top_level_one() -> str:
@@ -23,4 +23,4 @@ def top_level_one() -> str:
 
 
 def top_level_two(number: int) -> int:
-    return number * len(Path("xy").name)
+    return number * len(Path("xy").name) + len(top_level_one())
