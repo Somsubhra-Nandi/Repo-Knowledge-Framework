@@ -7,3 +7,4 @@ __pycache__/
 neo4j_data/
 graphrag_mcp.egg-info/
 venv/
+.cursor/
