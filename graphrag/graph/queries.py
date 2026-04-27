@@ -18,4 +18,3 @@ def create_indexes(driver: Driver) -> None:
     with driver.session() as session:
         for statement in statements:
             session.run(statement)
-
