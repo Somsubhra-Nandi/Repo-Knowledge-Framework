@@ -1,6 +1,8 @@
 __pycache__/
 *.pyc
 .pytest_cache/
+.pytest_tmp/
+.graphrag_tmp/
 .ruff_cache/
 .venv/
 .env
