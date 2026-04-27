@@ -240,3 +240,101 @@ def test_estimate_migration_cost_returns_effort_estimate() -> None:
         "HIGH",
         "VERY HIGH",
     }
+
+
+def test_query_graph_raw_rejects_write_operations() -> None:
+    from graphrag.mcp.server import query_graph_raw
+
+    result = query_graph_raw("CREATE (n:Test) RETURN n")
+    assert "error" in result
+
+
+def test_query_graph_raw_rejects_merge() -> None:
+    from graphrag.mcp.server import query_graph_raw
+
+    result = query_graph_raw("MERGE (n:Test {name: 'x'}) RETURN n")
+    assert "error" in result
+
+
+def test_query_graph_raw_allows_match() -> None:
+    from graphrag.mcp.server import query_graph_raw
+
+    with patch("graphrag.mcp.server._run_records", return_value=[]):
+        result = query_graph_raw("MATCH (n) RETURN n LIMIT 1")
+    assert "results" in result
+    assert "error" not in result
+
+
+def test_scaffold_polyglot_feature_returns_two_files() -> None:
+    from graphrag.mcp.server import scaffold_polyglot_feature
+
+    with patch("graphrag.mcp.server._run_records", return_value=[]):
+        result = scaffold_polyglot_feature("Payment")
+    assert "files" in result
+    assert len(result["files"]) == 2
+    languages = {file["language"] for file in result["files"]}
+    assert "python" in languages
+    assert "typescript" in languages
+
+
+def test_generate_test_suite_returns_correct_shape() -> None:
+    from graphrag.mcp.server import generate_test_suite
+
+    method_info = {
+        "name": "get_user",
+        "file": "service.py",
+        "language": "python",
+        "signature": "def get_user(self, id):",
+        "source_code": "return self.db.fetch(id)",
+    }
+    with patch("graphrag.mcp.server._run_single", return_value=method_info):
+        with patch("graphrag.mcp.server._run_records", return_value=[]):
+            result = generate_test_suite("service.UserService.get_user")
+    assert "test_file" in result
+    assert "content" in result["test_file"]
+
+
+def test_generate_architecture_diagram_module_type() -> None:
+    from graphrag.mcp.server import generate_architecture_diagram
+
+    mock_rows = [
+        {"from_path": "src/auth.py", "to_path": "src/db.py"},
+    ]
+    with patch("graphrag.mcp.server._run_records", return_value=mock_rows):
+        result = generate_architecture_diagram(diagram_type="module")
+    assert "mermaid" in result
+    assert "flowchart" in result["mermaid"]
+
+
+def test_generate_architecture_diagram_rejects_invalid_type() -> None:
+    from graphrag.mcp.server import generate_architecture_diagram
+
+    result = generate_architecture_diagram(diagram_type="invalid")
+    assert "error" in result
+
+
+def test_summarize_module_returns_correct_shape() -> None:
+    from graphrag.mcp.server import summarize_module
+
+    with patch("graphrag.mcp.server._run_records", return_value=[]):
+        result = summarize_module("src/auth")
+    assert "public_interface" in result
+    assert "external_dependencies" in result
+    assert "file_count" in result
+
+
+def test_explain_change_history_returns_correct_shape() -> None:
+    from graphrag.mcp.server import explain_change_history
+
+    with patch("graphrag.mcp.server._run_records", return_value=[]):
+        with patch(
+            "graphrag.mcp.server._run_single",
+            return_value={"method_count": 5, "avg_outgoing_calls": 2.3},
+        ):
+            with patch("subprocess.run") as mock_run:
+                mock_run.return_value.returncode = 0
+                mock_run.return_value.stdout = "abc1234 initial commit\n"
+                result = explain_change_history("src/auth.py")
+    assert "git_history" in result
+    assert "complexity_metrics" in result
+    assert "hotspot_methods" in result
