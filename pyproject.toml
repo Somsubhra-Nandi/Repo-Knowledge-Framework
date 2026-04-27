@@ -21,12 +21,14 @@ core = [
   "tree-sitter-java>=0.23.0",
   "tree-sitter-go>=0.23.0",
   "tree-sitter-rust>=0.23.0",
+  "mcp[cli]>=1.0.0",
   "neo4j",
   "pydantic>=2",
   "pydantic-settings>=2.3.0",
   "python-dotenv>=1.0.0",
   "fastapi",
-  "uvicorn[standard]"
+  "uvicorn[standard]",
+  "httpx>=0.27.0"
 ]
 dev = [
   "ruff"
@@ -37,6 +39,7 @@ test = [
 
 [project.scripts]
 graphrag = "graphrag.cli:main"
+graphrag-mcp = "graphrag.mcp.server:serve"
 
 [tool.setuptools]
 include-package-data = true
