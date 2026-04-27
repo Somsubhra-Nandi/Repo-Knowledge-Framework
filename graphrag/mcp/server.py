@@ -87,6 +87,20 @@ def _run_single(query: str, **parameters: Any) -> dict[str, Any] | dict[str, str
     return dict(record.items())
 
 
+def _as_int(value: Any) -> int | None:
+    return int(value) if value is not None else None
+
+
+def _as_float(value: Any) -> float:
+    return float(value) if value is not None else 0.0
+
+
+def _safe_depth(value: int, default: int) -> int:
+    if value < 1:
+        return default
+    return min(value, 10)
+
+
 @mcp.tool()
 def explore_architecture(repo_root: str = "") -> dict[str, Any]:
     """
@@ -467,6 +481,738 @@ def find_endpoints(keyword: str = "") -> dict[str, Any]:
         "keyword": keyword,
         "count": len(endpoints),
         "endpoints": endpoints,
+    }
+
+
+@mcp.tool()
+def trace_execution_flow(
+    fqn: str,
+    max_depth: int = 5,
+    min_confidence: float = 0.4,
+) -> dict[str, Any]:
+    """
+    Trace all downstream function calls from a given method.
+    Returns a tree of every function this method calls, recursively.
+    Use this to understand what a function does end-to-end.
+
+    Args:
+        fqn: Fully-qualified name of the starting method.
+        max_depth: Maximum call depth to traverse (default: 5).
+        min_confidence: Minimum edge confidence to include (default: 0.4).
+    """
+    depth_limit = _safe_depth(max_depth, default=5)
+    rows = _run_records(
+        f"""
+        MATCH path = (start:Method {{fqn: $fqn}})-[:CALLS*1..{depth_limit}]->(callee:Method)
+        WHERE ALL(r IN relationships(path) WHERE r.confidence >= $min_confidence)
+        WITH callee,
+             relationships(path) AS rels,
+             length(path) AS depth
+        WITH callee,
+             depth,
+             reduce(conf = 1.0, r IN rels | conf * r.confidence) AS path_confidence
+        RETURN callee.fqn AS callee_fqn,
+               callee.name AS callee_name,
+               callee.file AS callee_file,
+               callee.line AS callee_line,
+               depth,
+               path_confidence
+        ORDER BY depth ASC, path_confidence DESC
+        LIMIT 100
+        """,
+        fqn=fqn,
+        min_confidence=min_confidence,
+    )
+    if isinstance(rows, dict):
+        return rows
+
+    call_tree = [
+        {
+            "fqn": row.get("callee_fqn"),
+            "name": row.get("callee_name"),
+            "file": row.get("callee_file"),
+            "line": _as_int(row.get("callee_line")),
+            "depth": int(row.get("depth", 0)),
+            "path_confidence": round(_as_float(row.get("path_confidence")), 3),
+        }
+        for row in rows
+    ]
+    return {
+        "root_fqn": fqn,
+        "max_depth": depth_limit,
+        "min_confidence": min_confidence,
+        "total_nodes": len(call_tree),
+        "call_tree": call_tree,
+    }
+
+
+@mcp.tool()
+def analyze_blast_radius(
+    fqn: str,
+    max_depth: int = 5,
+    min_confidence: float = 0.4,
+    fan_out_threshold: int = 20,
+) -> dict[str, Any]:
+    """
+    Find everything that will break if you change this method.
+    Traverses UPSTREAM - returns all callers, their callers, tests,
+    and frontend components that depend on this method.
+    This is your most important tool before refactoring anything.
+
+    Args:
+        fqn: Fully-qualified name of the method you want to change.
+        max_depth: Maximum upstream depth to traverse (default: 5).
+        min_confidence: Minimum edge confidence to include (default: 0.4).
+        fan_out_threshold: Skip nodes with more than this many outgoing
+                           calls - they are utilities, not real dependents
+                           (default: 20).
+    """
+    depth_limit = _safe_depth(max_depth, default=5)
+    method_rows = _run_records(
+        f"""
+        MATCH path = (caller:Method)-[:CALLS*1..{depth_limit}]->(target:Method {{fqn: $fqn}})
+        WHERE ALL(r IN relationships(path) WHERE r.confidence >= $min_confidence)
+        WITH caller,
+             length(path) AS depth,
+             reduce(conf = 1.0, r IN relationships(path) | conf * r.confidence) AS path_confidence
+        WHERE path_confidence >= $min_confidence
+        WITH caller, depth, path_confidence
+        WHERE size([(caller)-[:CALLS]->() | 1]) <= $fan_out_threshold
+        RETURN caller.fqn AS caller_fqn,
+               caller.name AS caller_name,
+               caller.file AS caller_file,
+               caller.line AS caller_line,
+               caller.language AS language,
+               depth,
+               path_confidence
+        ORDER BY path_confidence DESC, depth ASC
+        LIMIT 100
+        """,
+        fqn=fqn,
+        min_confidence=min_confidence,
+        fan_out_threshold=fan_out_threshold,
+    )
+    if isinstance(method_rows, dict):
+        return method_rows
+
+    frontend_rows = _run_records(
+        """
+        MATCH (rc:RouteCall)-[:ROUTES_TO]->(e:Endpoint)<-[:HANDLES]-(target:Method {fqn: $fqn})
+        RETURN rc.source_method_fqn AS source_fqn,
+               rc.path AS api_path,
+               rc.http_method AS http_method
+        """,
+        fqn=fqn,
+    )
+    if isinstance(frontend_rows, dict):
+        return frontend_rows
+
+    affected_methods = [
+        {
+            "fqn": row.get("caller_fqn"),
+            "name": row.get("caller_name"),
+            "file": row.get("caller_file"),
+            "line": _as_int(row.get("caller_line")),
+            "language": row.get("language"),
+            "depth": int(row.get("depth", 0)),
+            "path_confidence": round(_as_float(row.get("path_confidence")), 3),
+        }
+        for row in method_rows
+    ]
+    frontend_callers = [
+        {
+            "source_fqn": row.get("source_fqn"),
+            "api_path": row.get("api_path"),
+            "http_method": row.get("http_method"),
+        }
+        for row in frontend_rows
+    ]
+    return {
+        "target_fqn": fqn,
+        "total_affected": len(affected_methods) + len(frontend_callers),
+        "affected_methods": affected_methods,
+        "frontend_callers": frontend_callers,
+    }
+
+
+@mcp.tool()
+def trace_network_boundary(path_or_method: str) -> dict[str, Any]:
+    """
+    Trace the complete request lifecycle from a frontend API call to
+    its backend handler. Input either a URL path ("/api/users") or
+    a frontend method name/FQN.
+    This is the cross-language killer feature - it works across
+    TypeScript frontend and Python/Java/Go backend with zero guessing.
+
+    Args:
+        path_or_method: Either a URL path like "/api/users" or a
+                        method name/FQN from the frontend code.
+    """
+    route_rows = _run_records(
+        """
+        MATCH (m:Method)-[:MAKES_CALL]->(rc:RouteCall)
+        WHERE rc.path CONTAINS $query
+           OR m.name CONTAINS $query
+           OR m.fqn CONTAINS $query
+        RETURN m.fqn AS source_fqn,
+               m.name AS source_name,
+               m.file AS source_file,
+               m.language AS source_language,
+               rc.path AS route_path,
+               rc.http_method AS http_method,
+               rc.confidence AS call_confidence
+        ORDER BY rc.path
+        LIMIT 10
+        """,
+        query=path_or_method,
+    )
+    if isinstance(route_rows, dict):
+        return route_rows
+
+    chains: list[dict[str, Any]] = []
+    for route in route_rows:
+        backend_rows = _run_records(
+            """
+            MATCH (rc:RouteCall {path: $path, http_method: $http_method})
+                  -[r1:ROUTES_TO]->(e:Endpoint)<-[:HANDLES]-(handler:Method)
+            RETURN e.path AS endpoint_path,
+                   e.http_method AS endpoint_method,
+                   r1.confidence AS stitch_confidence,
+                   r1.match_type AS match_type,
+                   handler.fqn AS handler_fqn,
+                   handler.name AS handler_name,
+                   handler.file AS handler_file,
+                   handler.language AS handler_language,
+                   handler.line AS handler_line
+            LIMIT 5
+            """,
+            path=route.get("route_path"),
+            http_method=route.get("http_method"),
+        )
+        if isinstance(backend_rows, dict):
+            return backend_rows
+
+        for backend in backend_rows:
+            downstream_rows = _run_records(
+                """
+                MATCH (handler:Method {fqn: $handler_fqn})-[:CALLS*1..3]->(downstream:Method)
+                RETURN downstream.fqn AS fqn,
+                       downstream.name AS name,
+                       downstream.file AS file,
+                       downstream.language AS language
+                ORDER BY downstream.fqn
+                LIMIT 20
+                """,
+                handler_fqn=backend.get("handler_fqn"),
+            )
+            if isinstance(downstream_rows, dict):
+                return downstream_rows
+
+            chains.append(
+                {
+                    "frontend": {
+                        "method_fqn": route.get("source_fqn"),
+                        "method_name": route.get("source_name"),
+                        "file": route.get("source_file"),
+                        "language": route.get("source_language"),
+                    },
+                    "route_call": {
+                        "path": route.get("route_path"),
+                        "http_method": route.get("http_method"),
+                        "confidence": _as_float(route.get("call_confidence")),
+                    },
+                    "stitch": {
+                        "confidence": _as_float(backend.get("stitch_confidence")),
+                        "match_type": backend.get("match_type"),
+                    },
+                    "backend_handler": {
+                        "fqn": backend.get("handler_fqn"),
+                        "name": backend.get("handler_name"),
+                        "file": backend.get("handler_file"),
+                        "language": backend.get("handler_language"),
+                        "line": _as_int(backend.get("handler_line")),
+                    },
+                    "downstream_calls": [
+                        {
+                            "fqn": row.get("fqn"),
+                            "name": row.get("name"),
+                            "file": row.get("file"),
+                            "language": row.get("language"),
+                        }
+                        for row in downstream_rows
+                    ],
+                }
+            )
+
+    return {
+        "query": path_or_method,
+        "chains": chains,
+    }
+
+
+@mcp.tool()
+def find_data_lineage(
+    method_fqn: str,
+    max_depth: int = 6,
+) -> dict[str, Any]:
+    """
+    Trace where data goes after entering a method - follow the call
+    chain downstream to find where it is persisted, returned, or
+    transformed. Useful for finding data flow bugs and understanding
+    what a payload touches.
+
+    Args:
+        method_fqn: FQN of the entry point method (e.g. an API handler).
+        max_depth: Maximum depth to trace downstream (default: 6).
+    """
+    depth_limit = _safe_depth(max_depth, default=6)
+    rows = _run_records(
+        f"""
+        MATCH path = (entry:Method {{fqn: $fqn}})-[:CALLS*1..{depth_limit}]->(node:Method)
+        WITH node,
+             length(path) AS depth,
+             reduce(conf = 1.0, r IN relationships(path) | conf * r.confidence) AS path_confidence
+        RETURN node.fqn AS fqn,
+               node.name AS name,
+               node.file AS file,
+               node.language AS language,
+               node.source_code AS source_code,
+               depth,
+               path_confidence
+        ORDER BY depth ASC, path_confidence DESC
+        LIMIT 50
+        """,
+        fqn=method_fqn,
+    )
+    if isinstance(rows, dict):
+        return rows
+
+    db_patterns = ("SELECT", "INSERT", "UPDATE", "DELETE", "query(", "execute(")
+    lineage = []
+    for row in rows:
+        source_code = str(row.get("source_code") or "")
+        lineage.append(
+            {
+                "fqn": row.get("fqn"),
+                "name": row.get("name"),
+                "file": row.get("file"),
+                "language": row.get("language"),
+                "depth": int(row.get("depth", 0)),
+                "path_confidence": round(_as_float(row.get("path_confidence")), 3),
+                "is_db_interaction": any(pattern in source_code for pattern in db_patterns),
+            }
+        )
+
+    return {
+        "entry_fqn": method_fqn,
+        "total_nodes": len(lineage),
+        "lineage": lineage,
+    }
+
+
+@mcp.tool()
+def find_circular_dependencies(scope: str = "") -> dict[str, Any]:
+    """
+    Find all circular import dependencies in the codebase.
+    Circular deps cause import errors, tight coupling, and make
+    refactoring extremely painful.
+
+    Args:
+        scope: Optional file path prefix to limit the search scope.
+               Leave empty to check the entire codebase.
+    """
+    rows = _run_records(
+        """
+        MATCH (a:File)-[:IMPORTS*2..6]->(a)
+        WHERE $scope = "" OR a.path STARTS WITH $scope
+        WITH DISTINCT a
+        MATCH (a)-[:IMPORTS]->(b:File)
+        WHERE (b)-[:IMPORTS*1..5]->(a)
+          AND ($scope = "" OR a.path STARTS WITH $scope)
+        RETURN a.path AS file_a,
+               b.path AS file_b
+        ORDER BY file_a
+        LIMIT 50
+        """,
+        scope=scope,
+    )
+    if isinstance(rows, dict):
+        return rows
+
+    cycles = [
+        {
+            "file_a": row.get("file_a"),
+            "file_b": row.get("file_b"),
+        }
+        for row in rows
+    ]
+    cycle_count = len(cycles)
+    scope_label = scope or "all"
+    message = (
+        f"Found {cycle_count} circular import dependencies in {scope_label}."
+        if cycle_count
+        else f"No circular import dependencies found in {scope_label}."
+    )
+    return {
+        "scope": scope,
+        "cycle_count": cycle_count,
+        "cycles": cycles,
+        "message": message,
+    }
+
+
+@mcp.tool()
+def find_dead_code(scope: str = "") -> dict[str, Any]:
+    """
+    Find all methods that are never called by anything.
+    These are safe deletion candidates - they add complexity with
+    zero value. Does not flag known entrypoints (main, __init__,
+    setUp, test_*, handle*, on_*).
+
+    Args:
+        scope: Optional file path prefix to limit search scope.
+    """
+    rows = _run_records(
+        """
+        MATCH (m:Method)
+        WHERE NOT (m)<-[:CALLS]-()
+          AND NOT m.name IN [
+            'main', '__init__', '__new__', '__str__', '__repr__',
+            'setUp', 'tearDown', 'setUpClass', 'tearDownClass'
+          ]
+          AND NOT m.name STARTS WITH 'test_'
+          AND NOT m.name STARTS WITH 'handle'
+          AND NOT m.name STARTS WITH 'on_'
+          AND ($scope = "" OR m.file STARTS WITH $scope)
+          AND NOT m.fqn STARTS WITH "unresolved."
+        RETURN m.fqn AS fqn,
+               m.name AS name,
+               m.file AS file,
+               m.line AS line,
+               m.language AS language
+        ORDER BY m.file, m.line
+        LIMIT 100
+        """,
+        scope=scope,
+    )
+    if isinstance(rows, dict):
+        return rows
+
+    dead_methods = [
+        {
+            "fqn": row.get("fqn"),
+            "name": row.get("name"),
+            "file": row.get("file"),
+            "line": _as_int(row.get("line")),
+            "language": row.get("language"),
+        }
+        for row in rows
+    ]
+    return {
+        "scope": scope,
+        "total_dead_methods": len(dead_methods),
+        "dead_methods": dead_methods,
+    }
+
+
+@mcp.tool()
+def identify_god_classes(
+    scope: str = "",
+    threshold: int = 10,
+) -> dict[str, Any]:
+    """
+    Find classes that do too much - high number of methods and
+    outgoing dependencies. These are your top refactoring targets.
+    God classes are the #1 cause of brittle, hard-to-test code.
+
+    Args:
+        scope: Optional file path prefix.
+        threshold: Minimum method count to flag as god class (default: 10).
+    """
+    rows = _run_records(
+        """
+        MATCH (c:Class)-[:CONTAINS]->(m:Method)
+        WHERE ($scope = "" OR c.file STARTS WITH $scope)
+        WITH c, count(m) AS method_count
+        WHERE method_count >= $threshold
+        OPTIONAL MATCH (c)-[:CONTAINS]->(m2:Method)-[:CALLS]->(dep:Method)
+        WHERE dep.file <> c.file
+        WITH c, method_count, count(DISTINCT dep) AS external_deps
+        RETURN c.fqn AS fqn,
+               c.name AS name,
+               c.file AS file,
+               c.language AS language,
+               method_count,
+               external_deps,
+               method_count + external_deps AS complexity_score
+        ORDER BY complexity_score DESC
+        LIMIT 20
+        """,
+        scope=scope,
+        threshold=threshold,
+    )
+    if isinstance(rows, dict):
+        return rows
+
+    god_classes = [
+        {
+            "fqn": row.get("fqn"),
+            "name": row.get("name"),
+            "file": row.get("file"),
+            "language": row.get("language"),
+            "method_count": int(row.get("method_count", 0)),
+            "external_deps": int(row.get("external_deps", 0)),
+            "complexity_score": int(row.get("complexity_score", 0)),
+        }
+        for row in rows
+    ]
+    return {
+        "scope": scope,
+        "threshold": threshold,
+        "total_found": len(god_classes),
+        "god_classes": god_classes,
+    }
+
+
+@mcp.tool()
+def check_architecture_drift(
+    rules: list[dict[str, str]] | None = None,
+) -> dict[str, Any]:
+    """
+    Check if any imports violate defined architectural layer rules.
+    Example rule: database layer must not import from UI layer.
+    Catches architectural decay before it becomes unmaintainable.
+
+    Args:
+        rules: List of violation rules. Each rule is a dict with:
+               {"from_layer": "db", "must_not_import": "ui"}
+               Layer names are matched as path prefixes.
+               If None, uses default rules.
+    """
+    default_rules = [
+        {"from_layer": "repository", "must_not_import": "controller"},
+        {"from_layer": "repository", "must_not_import": "router"},
+        {"from_layer": "database", "must_not_import": "view"},
+        {"from_layer": "database", "must_not_import": "ui"},
+        {"from_layer": "model", "must_not_import": "controller"},
+        {"from_layer": "model", "must_not_import": "router"},
+    ]
+    rules_to_check = rules if rules is not None else default_rules
+    violations: list[dict[str, Any]] = []
+
+    for rule in rules_to_check:
+        rows = _run_records(
+            """
+            MATCH (a:File)-[:IMPORTS]->(b:File)
+            WHERE a.path CONTAINS $from_layer
+              AND b.path CONTAINS $must_not_import
+            RETURN a.path AS violating_file,
+                   b.path AS imported_file
+            ORDER BY a.path
+            LIMIT 20
+            """,
+            from_layer=rule["from_layer"],
+            must_not_import=rule["must_not_import"],
+        )
+        if isinstance(rows, dict):
+            return rows
+
+        violations.extend(
+            {
+                "rule": rule,
+                "violating_file": row.get("violating_file"),
+                "imported_file": row.get("imported_file"),
+            }
+            for row in rows
+        )
+
+    return {
+        "rules_checked": len(rules_to_check),
+        "total_violations": len(violations),
+        "violations": violations,
+    }
+
+
+@mcp.tool()
+def map_third_party_deps(package_name: str) -> dict[str, Any]:
+    """
+    Find every internal method that touches a specific third-party
+    package. Use this before upgrading or removing a dependency to
+    understand the full blast radius of that change.
+
+    Args:
+        package_name: Name of the NPM/Pip/Cargo/Maven package.
+                      Partial names work: "django" matches "django-rest".
+    """
+    method_rows = _run_records(
+        """
+        MATCH (f:File)-[:IMPORTS]->(p:Package)
+        WHERE p.name CONTAINS $package_name
+        WITH f
+        MATCH (f)-[:CONTAINS*1..2]->(m:Method)
+        RETURN DISTINCT m.fqn AS fqn,
+                        m.name AS name,
+                        m.file AS file,
+                        m.language AS language,
+                        m.line AS line
+        ORDER BY m.file, m.line
+        LIMIT 100
+        """,
+        package_name=package_name,
+    )
+    if isinstance(method_rows, dict):
+        return method_rows
+
+    summary = _run_single(
+        """
+        MATCH (f:File)-[:IMPORTS]->(p:Package)
+        WHERE p.name CONTAINS $package_name
+        RETURN count(DISTINCT f) AS affected_files,
+               collect(DISTINCT p.name) AS matched_packages
+        """,
+        package_name=package_name,
+    )
+    if "error" in summary:
+        return summary
+
+    affected_methods = [
+        {
+            "fqn": row.get("fqn"),
+            "name": row.get("name"),
+            "file": row.get("file"),
+            "language": row.get("language"),
+            "line": _as_int(row.get("line")),
+        }
+        for row in method_rows
+    ]
+    return {
+        "package_query": package_name,
+        "matched_packages": list(summary.get("matched_packages", [])),
+        "affected_files": int(summary.get("affected_files", 0)),
+        "affected_methods_count": len(affected_methods),
+        "affected_methods": affected_methods,
+    }
+
+
+@mcp.tool()
+def find_interface_violations(scope: str = "") -> dict[str, Any]:
+    """
+    Find classes that are supposed to implement an interface/abstract
+    class but are missing required methods. These are contract violations
+    that cause runtime errors.
+
+    Args:
+        scope: Optional file path prefix.
+    """
+    rows = _run_records(
+        """
+        MATCH (interface:Class {is_interface: true})-[:CONTAINS]->(im:Method)
+        WHERE ($scope = "" OR interface.file STARTS WITH $scope)
+        WITH interface, im
+        WHERE NOT EXISTS {
+            MATCH (concrete:Class {is_interface: false})-[:CONTAINS]->(cm:Method)
+            WHERE cm.name = im.name
+              AND concrete.name <> interface.name
+        }
+        RETURN interface.fqn AS interface_fqn,
+               interface.name AS interface_name,
+               im.name AS unimplemented_method,
+               im.signature AS required_signature,
+               interface.file AS interface_file
+        ORDER BY interface.fqn
+        LIMIT 50
+        """,
+        scope=scope,
+    )
+    if isinstance(rows, dict):
+        return rows
+
+    violations = [
+        {
+            "interface_fqn": row.get("interface_fqn"),
+            "interface_name": row.get("interface_name"),
+            "unimplemented_method": row.get("unimplemented_method"),
+            "required_signature": row.get("required_signature"),
+            "interface_file": row.get("interface_file"),
+        }
+        for row in rows
+    ]
+    return {
+        "scope": scope,
+        "total_violations": len(violations),
+        "violations": violations,
+    }
+
+
+def _migration_effort(total_touch_points: int) -> str:
+    if total_touch_points < 10:
+        return "LOW"
+    if total_touch_points < 50:
+        return "MEDIUM"
+    if total_touch_points < 200:
+        return "HIGH"
+    return "VERY HIGH"
+
+
+@mcp.tool()
+def estimate_migration_cost(
+    from_package: str,
+    to_package: str = "",
+) -> dict[str, Any]:
+    """
+    Estimate the effort required to migrate away from a package.
+    Returns all files, methods, and edges that touch this package
+    so you can plan the migration work.
+
+    Args:
+        from_package: The package you want to migrate away from.
+        to_package: Optional replacement package name (just for labeling).
+    """
+    summary = _run_single(
+        """
+        MATCH (f:File)-[:IMPORTS]->(p:Package)
+        WHERE p.name CONTAINS $from_package
+        WITH collect(DISTINCT f) AS affected_files,
+             count(DISTINCT f) AS file_count
+        UNWIND affected_files AS f
+        MATCH (f)-[:CONTAINS*1..2]->(m:Method)
+        RETURN count(DISTINCT m) AS method_count,
+               file_count,
+               collect(DISTINCT f.path)[..20] AS sample_files
+        """,
+        from_package=from_package,
+    )
+    if "error" in summary:
+        return summary
+
+    callers = _run_single(
+        """
+        MATCH (f:File)-[:IMPORTS]->(p:Package)
+        WHERE p.name CONTAINS $from_package
+        WITH f
+        MATCH (f)-[:CONTAINS*1..2]->(m:Method)<-[:CALLS]-(caller:Method)
+        RETURN count(DISTINCT caller) AS dependent_callers
+        """,
+        from_package=from_package,
+    )
+    if "error" in callers:
+        return callers
+
+    affected_files = int(summary.get("file_count", 0))
+    affected_methods = int(summary.get("method_count", 0))
+    dependent_callers = int(callers.get("dependent_callers", 0))
+    total_touch_points = affected_files + affected_methods + dependent_callers
+    return {
+        "from_package": from_package,
+        "to_package": to_package,
+        "migration_cost": {
+            "affected_files": affected_files,
+            "affected_methods": affected_methods,
+            "dependent_callers": dependent_callers,
+            "total_touch_points": total_touch_points,
+            "effort_estimate": _migration_effort(total_touch_points),
+        },
+        "sample_files": list(summary.get("sample_files", [])),
     }
 
 
