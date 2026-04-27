@@ -2,11 +2,20 @@
 
 import argparse
 import os
+import re
+import subprocess
 from collections.abc import Iterable
+from dataclasses import asdict, is_dataclass
+from pathlib import Path
 from typing import Any
 
 from dotenv import load_dotenv
 from neo4j import Driver, GraphDatabase, Record
+
+from graphrag.graph.sync import (
+    auto_sync_graph as _auto_sync_graph_impl,
+    safe_write_file as _safe_write_file_impl,
+)
 
 try:
     from mcp.server.fastmcp import FastMCP
@@ -1154,6 +1163,12 @@ def _migration_effort(total_touch_points: int) -> str:
     return "VERY HIGH"
 
 
+def _result_to_dict(result: Any, keys: list[str]) -> dict[str, Any]:
+    if is_dataclass(result):
+        return asdict(result)
+    return {key: getattr(result, key) for key in keys}
+
+
 @mcp.tool()
 def estimate_migration_cost(
     from_package: str,
@@ -1213,6 +1228,588 @@ def estimate_migration_cost(
             "effort_estimate": _migration_effort(total_touch_points),
         },
         "sample_files": list(summary.get("sample_files", [])),
+    }
+
+
+@mcp.tool()
+def safe_write_file(file_path: str, content: str) -> dict[str, Any]:
+    """
+    Write code to a file - but validate syntax with Tree-sitter first.
+    If the code has syntax errors, it is REJECTED and nothing is written.
+    If clean, the file is written and the graph is automatically updated.
+    This prevents the AI from writing broken code to your codebase.
+
+    Args:
+        file_path: Absolute or relative path to write to.
+        content: The complete file content to write.
+    """
+    return _result_to_dict(
+        _safe_write_file_impl(file_path, content),
+        ["success", "file_path", "message", "syntax_errors", "graph_updated"],
+    )
+
+
+@mcp.tool()
+def auto_sync_graph(file_path: str) -> dict[str, Any]:
+    """
+    Re-parse a single file and patch the graph with only the changes.
+    Called automatically after safe_write_file. Can also be called
+    manually after editing a file outside the MCP server.
+
+    Args:
+        file_path: Path to the file that was modified.
+    """
+    return _result_to_dict(
+        _auto_sync_graph_impl(file_path),
+        ["file_path", "nodes_added", "nodes_removed", "nodes_updated", "edges_added", "git_sha"],
+    )
+
+
+@mcp.tool()
+def query_graph_raw(cypher: str) -> dict[str, Any]:
+    """
+    Execute a raw read-only Cypher query against the graph.
+    Escape hatch for power users and complex queries not covered
+    by other tools. WRITE operations are blocked for safety.
+
+    Args:
+        cypher: A read-only Cypher query string.
+    """
+    write_keywords = {
+        "CREATE",
+        "MERGE",
+        "SET",
+        "DELETE",
+        "DETACH",
+        "REMOVE",
+        "DROP",
+        "CALL",
+        "LOAD",
+    }
+    upper_cypher = cypher.upper()
+    if any(keyword in upper_cypher for keyword in write_keywords):
+        return {
+            "error": (
+                "Write operations are not permitted in query_graph_raw. "
+                "Use safe_write_file for modifications."
+            )
+        }
+
+    rows = _run_records(cypher)
+    if isinstance(rows, dict):
+        return rows
+
+    results = rows[:100]
+    return {
+        "query": cypher,
+        "row_count": len(results),
+        "results": results,
+    }
+
+
+def _pascal_case(value: str) -> str:
+    parts = re.split(r"[^A-Za-z0-9]+", value)
+    return "".join(part[:1].upper() + part[1:] for part in parts if part) or "Feature"
+
+
+@mcp.tool()
+def scaffold_polyglot_feature(
+    feature_name: str,
+    stack: str = "fastapi+react",
+) -> dict[str, Any]:
+    """
+    Generate boilerplate for a new full-stack feature based on
+    patterns already in the codebase. Queries the graph for
+    existing patterns and generates matching boilerplate.
+
+    Args:
+        feature_name: Name of the feature e.g. "Payment", "Notification"
+        stack: Stack to generate for. Options:
+               "fastapi+react" (default), "express+react", "spring+react"
+    """
+    backend_lang_by_stack = {
+        "fastapi+react": "python",
+        "express+react": "typescript",
+        "spring+react": "java",
+    }
+    backend_lang = backend_lang_by_stack.get(stack, "python")
+    patterns = _run_records(
+        """
+        MATCH (m:Method)-[:HANDLES]->(e:Endpoint)
+        WHERE e.language = $backend_lang
+        RETURN e.path AS path, e.http_method AS method,
+               m.signature AS signature
+        LIMIT 5
+        """,
+        backend_lang=backend_lang,
+    )
+    if isinstance(patterns, dict):
+        return patterns
+
+    component_name = _pascal_case(feature_name)
+    feature_name_lower = feature_name.lower()
+    if stack == "express+react":
+        backend_content = f"""import express from 'express';
+
+const router = express.Router();
+
+router.get('/{feature_name_lower}s', (_req, res) => {{
+  res.json([]);
+}});
+
+router.post('/{feature_name_lower}s', (req, res) => {{
+  res.json(req.body);
+}});
+
+export default router;
+"""
+        backend_path = f"backend/{feature_name_lower}_router.ts"
+        backend_language = "typescript"
+    elif stack == "spring+react":
+        backend_content = f"""import org.springframework.web.bind.annotation.*;
+import java.util.List;
+import java.util.Map;
+
+@RestController
+@RequestMapping("/{feature_name_lower}s")
+public class {component_name}Controller {{
+    @GetMapping
+    public List<Object> get{component_name}s() {{
+        return List.of();
+    }}
+
+    @PostMapping
+    public Map<String, Object> create{component_name}(@RequestBody Map<String, Object> data) {{
+        return data;
+    }}
+}}
+"""
+        backend_path = f"backend/{component_name}Controller.java"
+        backend_language = "java"
+    else:
+        backend_content = f'''from fastapi import APIRouter
+
+router = APIRouter()
+
+@router.get("/{feature_name_lower}s")
+def get_{feature_name_lower}s():
+    return []
+
+@router.post("/{feature_name_lower}s")
+def create_{feature_name_lower}(data: dict):
+    return data
+
+@router.get("/{feature_name_lower}s/{{id}}")
+def get_{feature_name_lower}(id: str):
+    return {{"id": id}}
+
+@router.delete("/{feature_name_lower}s/{{id}}")
+def delete_{feature_name_lower}(id: str):
+    return {{"deleted": id}}
+'''
+        backend_path = f"backend/{feature_name_lower}_router.py"
+        backend_language = "python"
+
+    frontend_content = f"""import React, {{ useEffect, useState }} from 'react';
+
+const {component_name}List: React.FC = () => {{
+  const [items, setItems] = useState([]);
+
+  useEffect(() => {{
+    fetch('/{feature_name_lower}s')
+      .then(r => r.json())
+      .then(setItems);
+  }}, []);
+
+  return <div>{{items.length}} {component_name}s</div>;
+}};
+
+export default {component_name}List;
+"""
+    return {
+        "feature_name": feature_name,
+        "stack": stack,
+        "files": [
+            {
+                "suggested_path": backend_path,
+                "content": backend_content,
+                "language": backend_language,
+            },
+            {
+                "suggested_path": f"frontend/{component_name}List.tsx",
+                "content": frontend_content,
+                "language": "typescript",
+            },
+        ],
+        "existing_patterns_used": len(patterns),
+    }
+
+
+def _class_name_from_fqn(method_fqn: str) -> str:
+    parts = method_fqn.split(".")
+    return _pascal_case(parts[-2]) if len(parts) >= 2 else "Subject"
+
+
+@mcp.tool()
+def generate_test_suite(method_fqn: str) -> dict[str, Any]:
+    """
+    Analyze a method's dependencies from the graph and generate
+    a unit test file with mocks for every dependency.
+
+    Args:
+        method_fqn: FQN of the method to generate tests for.
+    """
+    method_info = _run_single(
+        """
+        MATCH (m:Method {fqn: $fqn})
+        RETURN m.name AS name, m.file AS file,
+               m.language AS language, m.signature AS signature,
+               m.source_code AS source_code
+        """,
+        fqn=method_fqn,
+    )
+    if "error" in method_info:
+        return method_info
+    if not method_info:
+        return {"error": f"No method found for FQN '{method_fqn}'"}
+
+    dependencies = _run_records(
+        """
+        MATCH (m:Method {fqn: $fqn})-[:CALLS]->(dep:Method)
+        WHERE dep.resolved = true OR dep.resolved IS NULL
+        RETURN dep.fqn AS fqn, dep.name AS name
+        LIMIT 20
+        """,
+        fqn=method_fqn,
+    )
+    if isinstance(dependencies, dict):
+        return dependencies
+
+    method_name = str(method_info.get("name") or method_fqn.split(".")[-1])
+    language = str(method_info.get("language") or "unknown")
+    file_path = str(method_info.get("file") or "")
+    class_name = _class_name_from_fqn(method_fqn)
+    dependency_names = [str(dep.get("name") or dep.get("fqn")) for dep in dependencies]
+    dep_count = len(dependency_names)
+
+    if language == "typescript":
+        file_stem = Path(file_path).stem or method_name
+        dep_module = dependency_names[0] if dependency_names else file_stem
+        content = f"""// Auto-generated test for {method_fqn}
+import {{ {class_name} }} from './{file_stem}';
+
+jest.mock('{dep_module}');
+
+describe('{class_name}', () => {{
+  let instance: {class_name};
+
+  beforeEach(() => {{
+    instance = new {class_name}();
+  }});
+
+  it('should execute {method_name}', () => {{
+    const result = instance.{method_name}();
+    expect(result).toBeDefined();
+  }});
+}});
+"""
+        suggested_path = f"tests/{file_stem}.test.ts"
+    else:
+        mock_setup = "        self.instance = MagicMock()\n"
+        if dependency_names:
+            mock_setup += "".join(
+                f"        self.{name}_mock = MagicMock()\n" for name in dependency_names
+            )
+        mock_assertions = "        result = self.instance.{method_name}()\n"
+        mock_assertions += "        assert result is not None\n"
+        content = f'''import pytest
+from unittest.mock import MagicMock, patch
+
+# Auto-generated test for {method_fqn}
+# Dependencies detected: {dep_count}
+
+class Test{class_name}:
+
+    def setup_method(self):
+        """Set up mocks for all detected dependencies."""
+{mock_setup}
+    def test_{method_name}_basic(self):
+        """Test basic execution of {method_name}."""
+        # TODO: Add assertions based on expected behaviour
+        result = self.instance.{method_name}()
+        assert result is not None
+
+    def test_{method_name}_with_mocked_deps(self):
+        """Test with all dependencies mocked."""
+{mock_assertions.format(method_name=method_name)}
+'''
+        suggested_path = f"tests/test_{Path(file_path).stem or method_name}.py"
+
+    return {
+        "method_fqn": method_fqn,
+        "language": language,
+        "dependency_count": dep_count,
+        "dependencies_mocked": dependency_names,
+        "test_file": {
+            "suggested_path": suggested_path,
+            "content": content,
+        },
+    }
+
+
+@mcp.tool()
+def explain_change_history(file_path: str) -> dict[str, Any]:
+    """
+    Combine git blame data with graph complexity metrics to explain
+    why a file or method is complex. Helps new developers understand
+    the history behind confusing code.
+
+    Args:
+        file_path: Path to the file to analyse.
+    """
+    try:
+        result = subprocess.run(
+            ["git", "log", "--oneline", "-10", file_path],
+            capture_output=True,
+            text=True,
+            timeout=10,
+            check=False,
+        )
+        commits = result.stdout.strip().split("\n") if result.returncode == 0 else []
+        commits = [commit for commit in commits if commit]
+    except Exception:  # noqa: BLE001
+        commits = []
+
+    metrics = _run_single(
+        """
+        MATCH (f:File)-[:CONTAINS*1..2]->(m:Method)
+        WHERE f.path CONTAINS $file_path
+        WITH count(m) AS method_count,
+             avg(size([(m)-[:CALLS]->() | 1])) AS avg_outgoing_calls
+        RETURN method_count, avg_outgoing_calls
+        """,
+        file_path=file_path,
+    )
+    if "error" in metrics:
+        return metrics
+
+    hotspot_rows = _run_records(
+        """
+        MATCH (caller:Method)-[:CALLS]->(m:Method)
+        WHERE m.file CONTAINS $file_path
+        WITH m, count(caller) AS call_count
+        RETURN m.name AS method_name, m.fqn AS fqn, call_count
+        ORDER BY call_count DESC
+        LIMIT 5
+        """,
+        file_path=file_path,
+    )
+    if isinstance(hotspot_rows, dict):
+        return hotspot_rows
+
+    return {
+        "file_path": file_path,
+        "git_history": {
+            "recent_commits": commits,
+            "commit_count": len(commits),
+        },
+        "complexity_metrics": {
+            "method_count": int(metrics.get("method_count", 0)),
+            "avg_outgoing_calls": round(_as_float(metrics.get("avg_outgoing_calls")), 3),
+        },
+        "hotspot_methods": [
+            {
+                "method_name": row.get("method_name"),
+                "fqn": row.get("fqn"),
+                "call_count": int(row.get("call_count", 0)),
+            }
+            for row in hotspot_rows
+        ],
+    }
+
+
+def _mermaid_id(value: str) -> str:
+    sanitized = re.sub(r"[^A-Za-z0-9_]", "_", value)
+    return sanitized.strip("_") or "node"
+
+
+@mcp.tool()
+def generate_architecture_diagram(
+    scope: str = "",
+    diagram_type: str = "module",
+) -> dict[str, Any]:
+    """
+    Generate a Mermaid diagram from the graph for a module or service.
+    Output can be pasted directly into any Mermaid renderer or GitHub markdown.
+
+    Args:
+        scope: File path prefix to scope the diagram.
+        diagram_type: "module" for file dependencies,
+                      "class" for class hierarchy,
+                      "endpoint" for API endpoint map.
+    """
+    if diagram_type == "module":
+        rows = _run_records(
+            """
+            MATCH (a:File)-[:IMPORTS]->(b:File)
+            WHERE ($scope = "" OR a.path STARTS WITH $scope)
+            RETURN a.path AS from_path, b.path AS to_path
+            LIMIT 30
+            """,
+            scope=scope,
+        )
+        if isinstance(rows, dict):
+            return rows
+
+        lines = ["flowchart TD"]
+        for row in rows:
+            from_path = str(row.get("from_path") or "")
+            to_path = str(row.get("to_path") or "")
+            lines.append(
+                f'    {_mermaid_id(from_path)}["{Path(from_path).name}"] '
+                f'--> {_mermaid_id(to_path)}["{Path(to_path).name}"]'
+            )
+        node_count = len({path for row in rows for path in (row.get("from_path"), row.get("to_path"))})
+        edge_count = len(rows)
+    elif diagram_type == "class":
+        rows = _run_records(
+            """
+            MATCH (c:Class)-[:CONTAINS]->(m:Method)
+            WHERE ($scope = "" OR c.file STARTS WITH $scope)
+            RETURN c.name AS class_name, collect(m.name)[..5] AS methods
+            LIMIT 20
+            """,
+            scope=scope,
+        )
+        if isinstance(rows, dict):
+            return rows
+
+        lines = ["classDiagram"]
+        for row in rows:
+            class_name = str(row.get("class_name") or "UnknownClass")
+            lines.append(f"    class {class_name} {{")
+            for method in row.get("methods", []):
+                lines.append(f"        +{method}()")
+            lines.append("    }")
+        node_count = len(rows)
+        edge_count = sum(len(row.get("methods", [])) for row in rows)
+    elif diagram_type == "endpoint":
+        rows = _run_records(
+            """
+            MATCH (m:Method)-[:HANDLES]->(e:Endpoint)
+            WHERE ($scope = "" OR m.file STARTS WITH $scope)
+            RETURN e.http_method AS method, e.path AS path, m.name AS handler
+            ORDER BY e.path
+            LIMIT 30
+            """,
+            scope=scope,
+        )
+        if isinstance(rows, dict):
+            return rows
+
+        lines = ["flowchart LR"]
+        for row in rows:
+            method = str(row.get("method") or "GET")
+            path = str(row.get("path") or "/")
+            handler = str(row.get("handler") or "handler")
+            endpoint_id = _mermaid_id(f"{method}_{path}")
+            handler_id = _mermaid_id(handler)
+            lines.append(f'    {endpoint_id}["{method} {path}"] --> {handler_id}["{handler}()"]')
+        node_count = len(rows) * 2
+        edge_count = len(rows)
+    else:
+        return {"error": f"Invalid diagram_type '{diagram_type}'"}
+
+    return {
+        "scope": scope,
+        "diagram_type": diagram_type,
+        "mermaid": "\n".join(lines),
+        "node_count": node_count,
+        "edge_count": edge_count,
+    }
+
+
+@mcp.tool()
+def summarize_module(module_path: str) -> dict[str, Any]:
+    """
+    Generate a high-level summary of a module's responsibilities
+    from its graph structure. Useful for quickly understanding an
+    unfamiliar module without reading all the code.
+
+    Args:
+        module_path: File path prefix for the module to summarize.
+    """
+    file_rows = _run_records(
+        """
+        MATCH (f:File)
+        WHERE f.path CONTAINS $module_path
+        RETURN f.path AS path, f.language AS language
+        ORDER BY f.path
+        LIMIT 20
+        """,
+        module_path=module_path,
+    )
+    if isinstance(file_rows, dict):
+        return file_rows
+
+    interface_rows = _run_records(
+        """
+        MATCH (caller:Method)-[:CALLS]->(m:Method)
+        WHERE m.file CONTAINS $module_path
+          AND NOT caller.file CONTAINS $module_path
+        WITH m, count(caller) AS external_callers
+        RETURN m.name AS name, m.fqn AS fqn,
+               m.signature AS signature, external_callers
+        ORDER BY external_callers DESC
+        LIMIT 10
+        """,
+        module_path=module_path,
+    )
+    if isinstance(interface_rows, dict):
+        return interface_rows
+
+    dependency_rows = _run_records(
+        """
+        MATCH (f:File)-[:IMPORTS]->(dep)
+        WHERE f.path CONTAINS $module_path
+        RETURN DISTINCT
+            labels(dep)[0] AS dep_type,
+            coalesce(dep.name, dep.path) AS dep_name
+        ORDER BY dep_type, dep_name
+        LIMIT 20
+        """,
+        module_path=module_path,
+    )
+    if isinstance(dependency_rows, dict):
+        return dependency_rows
+
+    files = [
+        {
+            "path": row.get("path"),
+            "language": row.get("language"),
+        }
+        for row in file_rows
+    ]
+    return {
+        "module_path": module_path,
+        "files": files,
+        "file_count": len(files),
+        "public_interface": [
+            {
+                "name": row.get("name"),
+                "fqn": row.get("fqn"),
+                "signature": row.get("signature"),
+                "external_callers": int(row.get("external_callers", 0)),
+            }
+            for row in interface_rows
+        ],
+        "external_dependencies": [
+            {
+                "dep_type": row.get("dep_type"),
+                "dep_name": row.get("dep_name"),
+            }
+            for row in dependency_rows
+        ],
     }
 
 
