@@ -140,6 +140,96 @@ def _extract_ts_like_signature(source: bytes, node: Node, name: str) -> str:
     return f"{name}{parameters}{return_type}"
 
 
+def _first_child_text_by_type(source: bytes, node: Node, node_types: set[str]) -> str:
+    """Return text from the first direct child whose type matches."""
+    for child in node.children:
+        if child.type in node_types:
+            return _node_text(source, child).strip()
+    return ""
+
+
+def _first_descendant_text_by_type(source: bytes, node: Node, node_types: set[str]) -> str:
+    """Return text from the first matching descendant."""
+    stack: list[Node] = list(reversed(node.children))
+    while stack:
+        current = stack.pop()
+        if current.type in node_types:
+            return _node_text(source, current).strip()
+        stack.extend(reversed(current.children))
+    return ""
+
+
+def _get_enclosing_definition_name(source: bytes, node: Node, node_types: set[str]) -> str | None:
+    """Return the nearest enclosing class-like definition name."""
+    current = node.parent
+    while current is not None:
+        if current.type in node_types:
+            name = _find_identifier_text(source, current)
+            if not name:
+                name = _first_child_text_by_type(
+                    source,
+                    current,
+                    {"constant", "identifier", "type_identifier", "name", "namespace_identifier"},
+                )
+            return name or None
+        current = current.parent
+    return None
+
+
+def _append_class(
+    node: Node,
+    module_name: str,
+    classes: list[ClassInfo],
+    class_lookup: dict[str, ClassInfo],
+    class_name: str,
+) -> None:
+    """Append a ClassInfo if a class-like name was found."""
+    if not class_name:
+        return
+    class_info = ClassInfo(
+        name=class_name,
+        line=node.start_point[0] + 1,
+        methods=[],
+        fqn=build_fqn(module_name, class_name),
+    )
+    classes.append(class_info)
+    class_lookup[class_name] = class_info
+
+
+def _append_method(
+    source: bytes,
+    node: Node,
+    module_name: str,
+    methods: list[MethodInfo],
+    class_lookup: dict[str, ClassInfo],
+    method_name: str,
+    class_name: str | None,
+    signature: str | None = None,
+    calls: list[CallInfo] | None = None,
+) -> None:
+    """Append a MethodInfo and link it back to an enclosing class when possible."""
+    if not method_name:
+        return
+    method_fqn = (
+        build_fqn(module_name, class_name, method_name)
+        if class_name is not None
+        else build_fqn(module_name, method_name)
+    )
+    methods.append(
+        MethodInfo(
+            name=method_name,
+            line=node.start_point[0] + 1,
+            class_name=class_name,
+            fqn=method_fqn,
+            signature=signature if signature is not None else _node_text(source, node).splitlines()[0],
+            source_code=_node_text(source, node),
+            calls=calls if calls is not None else _collect_call_expressions(source, node),
+        )
+    )
+    if class_name is not None and class_name in class_lookup:
+        class_lookup[class_name].methods.append(method_name)
+
+
 def _collect_python_definitions(
     node: Node,
     source: bytes,
@@ -649,6 +739,595 @@ def _collect_java_definitions(
         )
 
 
+def _collect_ruby_definitions(
+    node: Node,
+    source: bytes,
+    module_name: str,
+    classes: list[ClassInfo],
+    methods: list[MethodInfo],
+    imports: list[str],
+    class_lookup: dict[str, ClassInfo],
+) -> None:
+    """Walk a Ruby tree and collect classes, modules, methods, and imports."""
+    if node.type == "call":
+        call_name = _first_child_text_by_type(source, node, {"identifier"}).strip()
+        if call_name in {"require", "require_relative", "include", "extend"}:
+            imports.append(_node_text(source, node).strip())
+    elif node.type in {"class", "module"}:
+        class_name = _first_child_text_by_type(source, node, {"constant"})
+        _append_class(node, module_name, classes, class_lookup, class_name)
+    elif node.type in {"method", "singleton_method"}:
+        method_name = _first_child_text_by_type(source, node, {"identifier"})
+        class_name = _get_enclosing_definition_name(source, node, {"class", "module"})
+        _append_method(
+            source,
+            node,
+            module_name,
+            methods,
+            class_lookup,
+            method_name,
+            class_name,
+        )
+
+    for child in node.children:
+        _collect_ruby_definitions(
+            node=child,
+            source=source,
+            module_name=module_name,
+            classes=classes,
+            methods=methods,
+            imports=imports,
+            class_lookup=class_lookup,
+        )
+
+
+def _collect_php_call_expressions(source: bytes, function_node: Node) -> list[CallInfo]:
+    """Collect common PHP call expressions."""
+    calls = _collect_call_expressions(source, function_node)
+    stack: list[Node] = [function_node]
+    while stack:
+        current = stack.pop()
+        if current.type in {"function_call_expression", "member_call_expression", "scoped_call_expression"}:
+            name_node = current.child_by_field_name("function") or current.child_by_field_name("name")
+            if name_node is not None:
+                calls.append(
+                    CallInfo(
+                        callee_name=_node_text(source, name_node).strip(),
+                        line=current.start_point[0] + 1,
+                    )
+                )
+        stack.extend(current.children)
+    return calls
+
+
+def _collect_php_definitions(
+    node: Node,
+    source: bytes,
+    module_name: str,
+    classes: list[ClassInfo],
+    methods: list[MethodInfo],
+    imports: list[str],
+    class_lookup: dict[str, ClassInfo],
+) -> None:
+    """Walk a PHP tree and collect classes, functions, methods, and imports."""
+    if node.type in {"namespace_use_declaration", "require_expression", "include_expression"}:
+        imports.append(_node_text(source, node).strip())
+    elif node.type in {"class_declaration", "interface_declaration"}:
+        _append_class(node, module_name, classes, class_lookup, _find_identifier_text(source, node))
+    elif node.type in {"function_definition", "method_declaration"}:
+        method_name = _find_identifier_text(source, node)
+        class_name: str | None = None
+        if node.type == "method_declaration":
+            class_name = _get_enclosing_definition_name(
+                source,
+                node,
+                {"class_declaration", "interface_declaration"},
+            )
+        _append_method(
+            source,
+            node,
+            module_name,
+            methods,
+            class_lookup,
+            method_name,
+            class_name,
+            calls=_collect_php_call_expressions(source, node),
+        )
+
+    for child in node.children:
+        _collect_php_definitions(
+            node=child,
+            source=source,
+            module_name=module_name,
+            classes=classes,
+            methods=methods,
+            imports=imports,
+            class_lookup=class_lookup,
+        )
+
+
+def _collect_swift_definitions(
+    node: Node,
+    source: bytes,
+    module_name: str,
+    classes: list[ClassInfo],
+    methods: list[MethodInfo],
+    imports: list[str],
+    class_lookup: dict[str, ClassInfo],
+) -> None:
+    """Walk a Swift tree and collect type declarations, functions, and imports."""
+    if node.type == "import_declaration":
+        imports.append(_node_text(source, node).strip())
+    elif node.type in {"class_declaration", "struct_declaration", "protocol_declaration"}:
+        class_name = _find_identifier_text(source, node)
+        if not class_name:
+            class_name = _first_child_text_by_type(source, node, {"type_identifier"})
+        _append_class(node, module_name, classes, class_lookup, class_name)
+    elif node.type in {"function_declaration", "init_declaration"}:
+        method_name = "init" if node.type == "init_declaration" else _find_identifier_text(source, node)
+        class_name = _get_enclosing_definition_name(
+            source,
+            node,
+            {"class_declaration", "struct_declaration", "protocol_declaration"},
+        )
+        _append_method(
+            source,
+            node,
+            module_name,
+            methods,
+            class_lookup,
+            method_name,
+            class_name,
+        )
+
+    for child in node.children:
+        _collect_swift_definitions(
+            node=child,
+            source=source,
+            module_name=module_name,
+            classes=classes,
+            methods=methods,
+            imports=imports,
+            class_lookup=class_lookup,
+        )
+
+
+def _collect_kotlin_definitions(
+    node: Node,
+    source: bytes,
+    module_name: str,
+    classes: list[ClassInfo],
+    methods: list[MethodInfo],
+    imports: list[str],
+    class_lookup: dict[str, ClassInfo],
+) -> None:
+    """Walk a Kotlin tree and collect classes, objects, functions, and imports."""
+    if node.type in {"import_header", "import"}:
+        imports.append(_node_text(source, node).strip())
+    elif node.type in {"class_declaration", "interface_declaration", "object_declaration"}:
+        class_name = _find_identifier_text(source, node)
+        _append_class(node, module_name, classes, class_lookup, class_name)
+    elif node.type == "function_declaration":
+        method_name = _find_identifier_text(source, node)
+        class_name = _get_enclosing_definition_name(
+            source,
+            node,
+            {"class_declaration", "interface_declaration", "object_declaration"},
+        )
+        _append_method(
+            source,
+            node,
+            module_name,
+            methods,
+            class_lookup,
+            method_name,
+            class_name,
+        )
+    elif node.type == "primary_constructor":
+        class_name = _get_enclosing_definition_name(source, node, {"class_declaration"})
+        if class_name is not None:
+            _append_method(
+                source,
+                node,
+                module_name,
+                methods,
+                class_lookup,
+                class_name,
+                class_name,
+            )
+
+    for child in node.children:
+        _collect_kotlin_definitions(
+            node=child,
+            source=source,
+            module_name=module_name,
+            classes=classes,
+            methods=methods,
+            imports=imports,
+            class_lookup=class_lookup,
+        )
+
+
+def _collect_shell_calls(source: bytes, function_node: Node) -> list[CallInfo]:
+    """Collect shell command invocations inside a function."""
+    calls: list[CallInfo] = []
+    stack: list[Node] = [function_node]
+    while stack:
+        current = stack.pop()
+        if current.type == "command":
+            command_name = ""
+            command_node = current.child_by_field_name("name")
+            if command_node is not None:
+                command_name = _node_text(source, command_node).strip()
+            if not command_name:
+                command_name = _first_descendant_text_by_type(source, current, {"word"})
+            if command_name:
+                calls.append(CallInfo(callee_name=command_name, line=current.start_point[0] + 1))
+        stack.extend(current.children)
+    return calls
+
+
+def _collect_shell_definitions(
+    node: Node,
+    source: bytes,
+    module_name: str,
+    classes: list[ClassInfo],
+    methods: list[MethodInfo],
+    imports: list[str],
+    class_lookup: dict[str, ClassInfo],
+) -> None:
+    """Walk a shell tree and collect functions, source imports, and command calls."""
+    if node.type == "command":
+        command_name = _first_descendant_text_by_type(source, node, {"word"})
+        if command_name == "source":
+            imports.append(_node_text(source, node).strip())
+    elif node.type == "function_definition":
+        method_name = _first_child_text_by_type(source, node, {"word"})
+        _append_method(
+            source,
+            node,
+            module_name,
+            methods,
+            class_lookup,
+            method_name,
+            None,
+            calls=_collect_shell_calls(source, node),
+        )
+
+    for child in node.children:
+        _collect_shell_definitions(
+            node=child,
+            source=source,
+            module_name=module_name,
+            classes=classes,
+            methods=methods,
+            imports=imports,
+            class_lookup=class_lookup,
+        )
+
+
+def _extract_sql_object_name(source: bytes, node: Node) -> str:
+    """Extract a SQL object name from common object/name descendants."""
+    name = _first_descendant_text_by_type(source, node, {"object_reference", "dotted_name"})
+    if name:
+        return name
+    return _first_descendant_text_by_type(source, node, {"identifier"})
+
+
+def _collect_sql_definitions(
+    node: Node,
+    source: bytes,
+    module_name: str,
+    classes: list[ClassInfo],
+    methods: list[MethodInfo],
+    imports: list[str],
+    class_lookup: dict[str, ClassInfo],
+) -> None:
+    """Walk a SQL tree and map tables/functions/data operations to graph nodes."""
+    node_text = _node_text(source, node).strip()
+    normalized = node_text.upper()
+    if node.type == "program":
+        for statement in node_text.split(";"):
+            stripped = statement.strip()
+            if stripped.upper().startswith(("SELECT", "INSERT", "UPDATE", "DELETE")):
+                imports.append(stripped)
+    elif node.type in {"create_table_statement", "create_table"}:
+        table_name = _extract_sql_object_name(source, node)
+        _append_class(node, module_name, classes, class_lookup, table_name)
+        _append_method(
+            source,
+            node,
+            module_name,
+            methods,
+            class_lookup,
+            "__table__",
+            table_name,
+            signature=f"table {table_name}",
+            calls=[],
+        )
+    elif node.type in {"create_function_statement", "create_procedure_statement"} or (
+        node.type == "ERROR" and normalized.startswith(("CREATE FUNCTION", "CREATE PROCEDURE"))
+    ):
+        function_name = _extract_sql_object_name(source, node)
+        _append_method(
+            source,
+            node,
+            module_name,
+            methods,
+            class_lookup,
+            function_name,
+            None,
+            calls=[],
+        )
+    elif node.type in {"select_statement", "insert_statement", "update_statement", "delete_statement"}:
+        if node.parent is not None and node.parent.type in {"program", "statement"}:
+            imports.append(node_text)
+    elif node.type == "statement" and normalized.startswith(("SELECT", "INSERT", "UPDATE", "DELETE")):
+        imports.append(node_text)
+
+    for child in node.children:
+        _collect_sql_definitions(
+            node=child,
+            source=source,
+            module_name=module_name,
+            classes=classes,
+            methods=methods,
+            imports=imports,
+            class_lookup=class_lookup,
+        )
+
+
+def _html_start_tag_name(source: bytes, node: Node) -> str:
+    """Return an HTML element or script start tag name."""
+    for child in node.children:
+        if child.type == "start_tag":
+            return _first_child_text_by_type(source, child, {"tag_name"}).lower()
+    return ""
+
+
+def _html_attribute_value(source: bytes, node: Node, attribute_name: str) -> str | None:
+    """Extract an HTML attribute value from a node's start tag."""
+    for child in node.children:
+        if child.type != "start_tag":
+            continue
+        for attribute in child.children:
+            if attribute.type != "attribute":
+                continue
+            text = _node_text(source, attribute).strip()
+            if not text.lower().startswith(f"{attribute_name.lower()}="):
+                continue
+            _, value = text.split("=", maxsplit=1)
+            return value.strip().strip("\"'")
+    return None
+
+
+def _collect_html_definitions(
+    node: Node,
+    source: bytes,
+    module_name: str,
+    classes: list[ClassInfo],
+    methods: list[MethodInfo],
+    imports: list[str],
+    class_lookup: dict[str, ClassInfo],
+) -> None:
+    """Walk an HTML tree and collect title, script, and stylesheet references."""
+    if node.type == "script_element":
+        src_value = _html_attribute_value(source, node, "src")
+        if src_value is not None:
+            imports.append(src_value)
+        _append_method(
+            source,
+            node,
+            module_name,
+            methods,
+            class_lookup,
+            "inline_script",
+            None,
+            calls=[],
+        )
+    elif node.type == "element" and _html_start_tag_name(source, node) == "link":
+        rel_value = _html_attribute_value(source, node, "rel")
+        href_value = _html_attribute_value(source, node, "href")
+        if rel_value == "stylesheet" and href_value is not None:
+            imports.append(href_value)
+    elif node.type == "element" and _html_start_tag_name(source, node) == "title":
+        title_text = _first_child_text_by_type(source, node, {"text"})
+        _append_class(node, module_name, classes, class_lookup, title_text)
+
+    for child in node.children:
+        _collect_html_definitions(
+            node=child,
+            source=source,
+            module_name=module_name,
+            classes=classes,
+            methods=methods,
+            imports=imports,
+            class_lookup=class_lookup,
+        )
+
+
+def _collect_css_definitions(
+    node: Node,
+    source: bytes,
+    module_name: str,
+    classes: list[ClassInfo],
+    methods: list[MethodInfo],
+    imports: list[str],
+    class_lookup: dict[str, ClassInfo],
+) -> None:
+    """Walk a CSS tree and collect imports and selectors."""
+    if node.type in {"import_statement", "import"}:
+        imports.append(_node_text(source, node).strip())
+    elif node.type == "rule_set":
+        selector_text = _first_child_text_by_type(source, node, {"selectors"})
+        if selector_text:
+            _append_method(
+                source,
+                node,
+                module_name,
+                methods,
+                class_lookup,
+                selector_text[:50],
+                None,
+                signature=selector_text,
+                calls=[],
+            )
+
+    for child in node.children:
+        _collect_css_definitions(
+            node=child,
+            source=source,
+            module_name=module_name,
+            classes=classes,
+            methods=methods,
+            imports=imports,
+            class_lookup=class_lookup,
+        )
+
+
+def _extract_c_declarator_name(source: bytes, node: Node) -> str:
+    """Extract an identifier from nested C/C++ declarator nodes."""
+    name_node = node.child_by_field_name("declarator")
+    if name_node is not None:
+        name = _extract_c_declarator_name(source, name_node)
+        if name:
+            return name
+    if node.type in {"identifier", "field_identifier"}:
+        return _node_text(source, node).strip()
+    for child in node.children:
+        if child.type in {"identifier", "field_identifier"}:
+            return _node_text(source, child).strip()
+    for child in node.children:
+        name = _extract_c_declarator_name(source, child)
+        if name:
+            return name
+    return ""
+
+
+def _extract_c_function_name(source: bytes, node: Node) -> str:
+    """Extract a C/C++ function name from a function definition."""
+    declarator = node.child_by_field_name("declarator")
+    if declarator is None:
+        return ""
+    return _extract_c_declarator_name(source, declarator)
+
+
+def _extract_c_signature(source: bytes, node: Node) -> str:
+    """Build a best-effort C/C++ function signature."""
+    type_node = node.child_by_field_name("type")
+    declarator_node = node.child_by_field_name("declarator")
+    return_type = _node_text(source, type_node).strip() if type_node is not None else ""
+    declarator = _node_text(source, declarator_node).strip() if declarator_node is not None else ""
+    return f"{return_type} {declarator}".strip()
+
+
+def _collect_c_definitions(
+    node: Node,
+    source: bytes,
+    module_name: str,
+    classes: list[ClassInfo],
+    methods: list[MethodInfo],
+    imports: list[str],
+    class_lookup: dict[str, ClassInfo],
+) -> None:
+    """Walk a C tree and collect typedef structs, functions, includes, and calls."""
+    if node.type == "preproc_include":
+        imports.append(_node_text(source, node).strip())
+    elif node.type == "type_definition":
+        if any(child.type == "struct_specifier" for child in node.children):
+            class_name = _first_child_text_by_type(source, node, {"type_identifier"})
+            _append_class(node, module_name, classes, class_lookup, class_name)
+    elif node.type == "function_definition":
+        method_name = _extract_c_function_name(source, node)
+        _append_method(
+            source,
+            node,
+            module_name,
+            methods,
+            class_lookup,
+            method_name,
+            None,
+            signature=_extract_c_signature(source, node),
+        )
+
+    for child in node.children:
+        _collect_c_definitions(
+            node=child,
+            source=source,
+            module_name=module_name,
+            classes=classes,
+            methods=methods,
+            imports=imports,
+            class_lookup=class_lookup,
+        )
+
+
+def _get_enclosing_cpp_namespace(source: bytes, node: Node) -> str | None:
+    """Return nearest enclosing C++ namespace name."""
+    current = node.parent
+    while current is not None:
+        if current.type == "namespace_definition":
+            namespace_name = _find_identifier_text(source, current)
+            if not namespace_name:
+                namespace_name = _first_child_text_by_type(source, current, {"namespace_identifier"})
+            return namespace_name or None
+        current = current.parent
+    return None
+
+
+def _collect_cpp_definitions(
+    node: Node,
+    source: bytes,
+    module_name: str,
+    classes: list[ClassInfo],
+    methods: list[MethodInfo],
+    imports: list[str],
+    class_lookup: dict[str, ClassInfo],
+) -> None:
+    """Walk a C++ tree and collect classes, structs, functions, includes, and calls."""
+    namespace_name = _get_enclosing_cpp_namespace(source, node)
+    effective_module = build_fqn(module_name, namespace_name or "")
+    if node.type == "preproc_include":
+        imports.append(_node_text(source, node).strip())
+    elif node.type == "type_definition":
+        if any(child.type == "struct_specifier" for child in node.children):
+            class_name = _first_child_text_by_type(source, node, {"type_identifier"})
+            _append_class(node, effective_module, classes, class_lookup, class_name)
+    elif node.type in {"class_specifier", "struct_specifier"}:
+        class_name = _find_identifier_text(source, node)
+        if not class_name:
+            class_name = _first_child_text_by_type(source, node, {"type_identifier"})
+        _append_class(node, effective_module, classes, class_lookup, class_name)
+    elif node.type == "function_definition":
+        method_name = _extract_c_function_name(source, node)
+        class_name = _get_enclosing_definition_name(
+            source,
+            node,
+            {"class_specifier", "struct_specifier"},
+        )
+        _append_method(
+            source,
+            node,
+            effective_module,
+            methods,
+            class_lookup,
+            method_name,
+            class_name,
+            signature=_extract_c_signature(source, node),
+        )
+
+    for child in node.children:
+        _collect_cpp_definitions(
+            node=child,
+            source=source,
+            module_name=module_name,
+            classes=classes,
+            methods=methods,
+            imports=imports,
+            class_lookup=class_lookup,
+        )
+
+
 def parse_file(file_path: str) -> ParsedFile:
     """Parse a single source file into structured metadata."""
     parser = get_parser(file_path)
@@ -714,6 +1393,106 @@ def parse_file(file_path: str) -> ParsedFile:
         )
     elif language_name == "rust":
         _collect_rust_definitions(
+            node=tree.root_node,
+            source=source_bytes,
+            module_name=module_name,
+            classes=classes,
+            methods=methods,
+            imports=imports,
+            class_lookup=class_lookup,
+        )
+    elif language_name == "ruby":
+        _collect_ruby_definitions(
+            node=tree.root_node,
+            source=source_bytes,
+            module_name=module_name,
+            classes=classes,
+            methods=methods,
+            imports=imports,
+            class_lookup=class_lookup,
+        )
+    elif language_name == "php":
+        _collect_php_definitions(
+            node=tree.root_node,
+            source=source_bytes,
+            module_name=module_name,
+            classes=classes,
+            methods=methods,
+            imports=imports,
+            class_lookup=class_lookup,
+        )
+    elif language_name == "swift":
+        _collect_swift_definitions(
+            node=tree.root_node,
+            source=source_bytes,
+            module_name=module_name,
+            classes=classes,
+            methods=methods,
+            imports=imports,
+            class_lookup=class_lookup,
+        )
+    elif language_name == "kotlin":
+        _collect_kotlin_definitions(
+            node=tree.root_node,
+            source=source_bytes,
+            module_name=module_name,
+            classes=classes,
+            methods=methods,
+            imports=imports,
+            class_lookup=class_lookup,
+        )
+    elif language_name == "shell":
+        _collect_shell_definitions(
+            node=tree.root_node,
+            source=source_bytes,
+            module_name=module_name,
+            classes=classes,
+            methods=methods,
+            imports=imports,
+            class_lookup=class_lookup,
+        )
+    elif language_name == "sql":
+        _collect_sql_definitions(
+            node=tree.root_node,
+            source=source_bytes,
+            module_name=module_name,
+            classes=classes,
+            methods=methods,
+            imports=imports,
+            class_lookup=class_lookup,
+        )
+    elif language_name == "html":
+        _collect_html_definitions(
+            node=tree.root_node,
+            source=source_bytes,
+            module_name=module_name,
+            classes=classes,
+            methods=methods,
+            imports=imports,
+            class_lookup=class_lookup,
+        )
+    elif language_name == "css":
+        _collect_css_definitions(
+            node=tree.root_node,
+            source=source_bytes,
+            module_name=module_name,
+            classes=classes,
+            methods=methods,
+            imports=imports,
+            class_lookup=class_lookup,
+        )
+    elif language_name == "c":
+        _collect_c_definitions(
+            node=tree.root_node,
+            source=source_bytes,
+            module_name=module_name,
+            classes=classes,
+            methods=methods,
+            imports=imports,
+            class_lookup=class_lookup,
+        )
+    elif language_name == "cpp":
+        _collect_cpp_definitions(
             node=tree.root_node,
             source=source_bytes,
             module_name=module_name,
