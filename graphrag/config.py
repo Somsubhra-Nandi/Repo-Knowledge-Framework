@@ -4,6 +4,7 @@ class Settings(BaseSettings):
     neo4j_uri: str = "bolt://neo4j:7687"
     neo4j_username: str = "neo4j"
     neo4j_password: str = "neo4j_password"
+    neo4j_database: str = "neo4j"
     repo_root_path: str = "/workspace"
     log_level: str = "INFO"
 
