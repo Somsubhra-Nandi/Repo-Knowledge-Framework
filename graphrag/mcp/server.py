@@ -1833,7 +1833,9 @@ def serve() -> None:
     if args.transport == "stdio":
         mcp.run(transport="stdio")
     else:
-        mcp.run(transport="sse", port=args.port)
+        mcp.settings.host = "0.0.0.0"
+        mcp.settings.port = args.port
+        mcp.run(transport="sse")
 
 
 if __name__ == "__main__":
