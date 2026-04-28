@@ -6,13 +6,15 @@ ENV PYTHONUNBUFFERED=1
 WORKDIR /workspace
 
 RUN apt-get update \
-    && apt-get install -y --no-install-recommends build-essential \
+    && apt-get install -y --no-install-recommends \
+       build-essential git \
     && rm -rf /var/lib/apt/lists/*
 
-COPY pyproject.toml /workspace/pyproject.toml
-COPY graphrag /workspace/graphrag
-
+COPY pyproject.toml README.md ./
 RUN pip install --upgrade pip \
-    && pip install -e ".[core,dev,test]"
+    && pip install -e ".[core]" --no-cache-dir
 
-COPY . /workspace
+COPY . .
+
+EXPOSE 8000
+CMD ["uvicorn", "graphrag.api:app", "--host", "0.0.0.0", "--port", "8000"]

@@ -8,5 +8,7 @@ __pycache__/
 .env
 neo4j_data/
 graphrag_mcp.egg-info/
+mcp_config.json
 venv/
 .cursor/
+.vscode/
