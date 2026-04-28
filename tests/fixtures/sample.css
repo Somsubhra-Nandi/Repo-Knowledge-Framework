@@ -1,0 +1,20 @@
+@import url('base.css');
+
+.container {
+    display: flex;
+    flex-direction: column;
+}
+
+#app {
+    width: 100%;
+}
+
+.user-card:hover {
+    background-color: #f0f0f0;
+}
+
+@media (max-width: 768px) {
+    .container {
+        flex-direction: row;
+    }
+}
