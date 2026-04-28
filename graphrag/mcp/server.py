@@ -76,18 +76,18 @@ def _records_to_dicts(records: Iterable[Record]) -> list[dict[str, Any]]:
     return [dict(record.items()) for record in records]
 
 
-def _run_records(query: str, **parameters: Any) -> list[dict[str, Any]] | dict[str, str]:
+def _run_records(cypher: str, **parameters: Any) -> list[dict[str, Any]] | dict[str, str]:
     try:
         with _get_driver().session() as session:
-            return _records_to_dicts(session.run(query, **parameters))
+            return _records_to_dicts(session.run(cypher, **parameters))
     except Exception as exc:  # noqa: BLE001
         return _error_response(exc)
 
 
-def _run_single(query: str, **parameters: Any) -> dict[str, Any] | dict[str, str]:
+def _run_single(cypher: str, **parameters: Any) -> dict[str, Any] | dict[str, str]:
     try:
         with _get_driver().session() as session:
-            record = session.run(query, **parameters).single()
+            record = session.run(cypher, **parameters).single()
     except Exception as exc:  # noqa: BLE001
         return _error_response(exc)
 
@@ -660,9 +660,9 @@ def trace_network_boundary(path_or_method: str) -> dict[str, Any]:
     route_rows = _run_records(
         """
         MATCH (m:Method)-[:MAKES_CALL]->(rc:RouteCall)
-        WHERE rc.path CONTAINS $query
-           OR m.name CONTAINS $query
-           OR m.fqn CONTAINS $query
+        WHERE rc.path CONTAINS $search_term
+           OR m.name CONTAINS $search_term
+           OR m.fqn CONTAINS $search_term
         RETURN m.fqn AS source_fqn,
                m.name AS source_name,
                m.file AS source_file,
@@ -673,7 +673,7 @@ def trace_network_boundary(path_or_method: str) -> dict[str, Any]:
         ORDER BY rc.path
         LIMIT 10
         """,
-        query=path_or_method,
+        search_term=path_or_method,
     )
     if isinstance(route_rows, dict):
         return route_rows
