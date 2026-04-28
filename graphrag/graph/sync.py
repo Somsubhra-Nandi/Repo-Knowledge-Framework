@@ -53,8 +53,11 @@ def _validation_temp_dir() -> Path:
     temp_dir = Path("/tmp")
     try:
         temp_dir.mkdir(parents=True, exist_ok=True)
+        probe = temp_dir / "graphrag_validate_write_test.tmp"
+        probe.write_text("", encoding="utf-8")
+        probe.unlink(missing_ok=True)
         return temp_dir
-    except PermissionError:
+    except OSError:
         fallback = Path.cwd() / ".graphrag_tmp"
         fallback.mkdir(parents=True, exist_ok=True)
         return fallback
