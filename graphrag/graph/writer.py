@@ -24,10 +24,12 @@ class Neo4jWriter:
         uri: str,
         username: str,
         password: str,
+        repo_id: str = "default",
         repo_index: RepoIndex | None = None,
     ) -> None:
         self._driver: Driver = GraphDatabase.driver(uri, auth=(username, password))
         self._repo_prefix = os.getenv("REPO_ROOT_PATH", "").replace("\\", "/").strip("./").replace("/", ".")
+        self._repo_id = repo_id
         self._repo_index = repo_index or RepoIndex()
 
     def ingest_file(self, parsed_file: ParsedFile) -> None:
@@ -100,15 +102,18 @@ class Neo4jWriter:
 
     def _write_folder(self, tx: Transaction, folder_path: str, folder_name: str) -> None:
         tx.run(
-            "MERGE (:Folder {path: $path, name: $name})",
+            """
+            MERGE (n:Folder {path: $path, name: $name, repo_id: $repo_id})
+            """,
             path=folder_path,
             name=folder_name,
+            repo_id=self._repo_id,
         )
 
     def _write_file(self, tx: Transaction, parsed_file: ParsedFile) -> None:
         tx.run(
             """
-            MERGE (f:File {path: $path})
+            MERGE (f:File {path: $path, repo_id: $repo_id})
             SET f.language = $language,
                 f.checksum = $checksum,
                 f.module_name = $module_name,
@@ -119,21 +124,23 @@ class Neo4jWriter:
             checksum=parsed_file.checksum,
             module_name=parsed_file.module_name,
             last_parsed=datetime.now(tz=UTC).isoformat(),
+            repo_id=self._repo_id,
         )
         tx.run(
             """
-            MATCH (folder:Folder {path: $folder_path})
-            MATCH (file:File {path: $file_path})
+            MATCH (folder:Folder {path: $folder_path, repo_id: $repo_id})
+            MATCH (file:File {path: $file_path, repo_id: $repo_id})
             MERGE (folder)-[:CONTAINS]->(file)
             """,
             folder_path=parsed_file.folder.path,
             file_path=parsed_file.path,
+            repo_id=self._repo_id,
         )
 
     def _write_class(self, tx: Transaction, class_node: ClassNode, file_path: str) -> None:
         tx.run(
             """
-            MERGE (c:Class {fqn: $fqn})
+            MERGE (c:Class {fqn: $fqn, repo_id: $repo_id})
             SET c.name = $name,
                 c.file = $file,
                 c.line = $line,
@@ -148,15 +155,17 @@ class Neo4jWriter:
             language=class_node.language,
             is_interface=class_node.is_interface,
             is_abstract=class_node.is_abstract,
+            repo_id=self._repo_id,
         )
         tx.run(
             """
-            MATCH (f:File {path: $file_path})
-            MATCH (c:Class {fqn: $fqn})
+            MATCH (f:File {path: $file_path, repo_id: $repo_id})
+            MATCH (c:Class {fqn: $fqn, repo_id: $repo_id})
             MERGE (f)-[:CONTAINS]->(c)
             """,
             file_path=file_path,
             fqn=class_node.fqn,
+            repo_id=self._repo_id,
         )
 
     def _write_method(
@@ -168,7 +177,7 @@ class Neo4jWriter:
     ) -> None:
         tx.run(
             """
-            MERGE (m:Method {fqn: $fqn})
+            MERGE (m:Method {fqn: $fqn, repo_id: $repo_id})
             SET m.name = $name,
                 m.file = $file,
                 m.line = $line,
@@ -185,28 +194,31 @@ class Neo4jWriter:
             source_code=method_node.source_code,
             language=method_node.language,
             is_dynamic=method_node.is_dynamic,
+            repo_id=self._repo_id,
         )
 
         if parent_fqn:
             tx.run(
                 """
-                MATCH (parent:Class {fqn: $parent_fqn})
-                MATCH (m:Method {fqn: $fqn})
+                MATCH (parent:Class {fqn: $parent_fqn, repo_id: $repo_id})
+                MATCH (m:Method {fqn: $fqn, repo_id: $repo_id})
                 MERGE (parent)-[:CONTAINS]->(m)
                 """,
                 parent_fqn=parent_fqn,
                 fqn=method_node.fqn,
+                repo_id=self._repo_id,
             )
             return
 
         tx.run(
             """
-            MATCH (f:File {path: $file_path})
-            MATCH (m:Method {fqn: $fqn})
+            MATCH (f:File {path: $file_path, repo_id: $repo_id})
+            MATCH (m:Method {fqn: $fqn, repo_id: $repo_id})
             MERGE (f)-[:CONTAINS]->(m)
             """,
             file_path=file_path,
             fqn=method_node.fqn,
+            repo_id=self._repo_id,
         )
 
     def _write_call_edges(
@@ -220,8 +232,8 @@ class Neo4jWriter:
             resolved_call = resolver.resolve(callee_name=call.callee_name, line=call.line)
             tx.run(
                 """
-                MERGE (caller:Method {fqn: $caller_fqn})
-                MERGE (callee:Method {fqn: $callee_fqn})
+                MERGE (caller:Method {fqn: $caller_fqn, repo_id: $repo_id})
+                MERGE (callee:Method {fqn: $callee_fqn, repo_id: $repo_id})
                 MERGE (caller)-[r:CALLS]->(callee)
                 SET r.line = $line,
                     r.confidence = $confidence,
@@ -232,6 +244,7 @@ class Neo4jWriter:
                 line=resolved_call.line,
                 confidence=resolved_call.confidence,
                 resolved=resolved_call.resolved,
+                repo_id=self._repo_id,
             )
 
     def _parse_import_entry(self, import_text: str) -> tuple[str, list[str]]:
@@ -255,38 +268,40 @@ class Neo4jWriter:
             if is_external:
                 tx.run(
                     """
-                    MERGE (p:Package {name: $module_name})
+                    MERGE (p:Package {name: $module_name, repo_id: $repo_id})
                     WITH p
-                    MATCH (f:File {path: $file_path})
+                    MATCH (f:File {path: $file_path, repo_id: $repo_id})
                     MERGE (f)-[:IMPORTS {symbols: $symbols}]->(p)
                     """,
                     module_name=module_name,
                     file_path=parsed_file.path,
                     symbols=symbols,
+                    repo_id=self._repo_id,
                 )
             else:
                 target_path = f"{module_name.replace('.', '/')}.py"
                 tx.run(
                     """
-                    MATCH (f:File {path: $file_path})
-                    MERGE (target:File {path: $target_path})
+                    MATCH (f:File {path: $file_path, repo_id: $repo_id})
+                    MERGE (target:File {path: $target_path, repo_id: $repo_id})
                     MERGE (f)-[:IMPORTS {symbols: $symbols}]->(target)
                     """,
                     file_path=parsed_file.path,
                     target_path=target_path,
                     symbols=symbols,
+                    repo_id=self._repo_id,
                 )
 
     def _write_endpoint(self, tx: Transaction, endpoint: EndpointNode) -> None:
         tx.run(
             """
-            MERGE (e:Endpoint {path: $path, http_method: $http_method})
+            MERGE (e:Endpoint {path: $path, http_method: $http_method, repo_id: $repo_id})
             SET e.handler_fqn = $handler_fqn,
                 e.language = $language,
                 e.file = $file,
                 e.line = $line
             WITH e
-            MATCH (m:Method {fqn: $handler_fqn})
+            MATCH (m:Method {fqn: $handler_fqn, repo_id: $repo_id})
             MERGE (m)-[:HANDLES]->(e)
             """,
             path=endpoint.path,
@@ -295,6 +310,7 @@ class Neo4jWriter:
             language=endpoint.language,
             file=endpoint.file,
             line=endpoint.line,
+            repo_id=self._repo_id,
         )
 
     def _write_route_call(self, tx: Transaction, route_call: RouteCall) -> None:
@@ -304,13 +320,14 @@ class Neo4jWriter:
             MERGE (rc:RouteCall {
                 source_method_fqn: $source_method_fqn,
                 path: $path,
-                http_method: $http_method
+                http_method: $http_method,
+                repo_id: $repo_id
             })
             SET rc.confidence = $confidence,
                 rc.line = $line,
                 rc.source_file = $source_file
             WITH rc
-            MATCH (m:Method {fqn: $source_method_fqn})
+            MATCH (m:Method {fqn: $source_method_fqn, repo_id: $repo_id})
             MERGE (m)-[:MAKES_CALL]->(rc)
             """,
             source_method_fqn=route_call.source_method_fqn,
@@ -319,5 +336,6 @@ class Neo4jWriter:
             confidence=route_call.confidence,
             line=route_call.line,
             source_file=route_call.source_file,
+            repo_id=self._repo_id,
         )
 

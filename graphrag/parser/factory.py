@@ -61,6 +61,7 @@ class ParsedFile:
     folder: FolderNode
     module_name: str
     checksum: str
+    repo_id: str = "default"
 
 
 def get_parser(file_path: str) -> Parser:
@@ -1328,7 +1329,7 @@ def _collect_cpp_definitions(
         )
 
 
-def parse_file(file_path: str) -> ParsedFile:
+def parse_file(file_path: str, repo_id: str = "default") -> ParsedFile:
     """Parse a single source file into structured metadata."""
     parser = get_parser(file_path)
     extension = Path(file_path).suffix
@@ -1511,5 +1512,6 @@ def parse_file(file_path: str) -> ParsedFile:
         folder=folder,
         module_name=module_name,
         checksum=checksum,
+        repo_id=repo_id,
     )
 

@@ -6,6 +6,7 @@ class Settings(BaseSettings):
     neo4j_password: str = "neo4j_password"
     neo4j_database: str = "neo4j"
     repo_root_path: str = "/workspace"
+    default_repo_id: str = "default"
     log_level: str = "INFO"
 
     class Config:

@@ -31,8 +31,9 @@ class RouteStitcher:
     Matches RouteCall nodes to Endpoint nodes in Neo4j and creates ROUTES_TO edges.
     """
 
-    def __init__(self, uri: str, username: str, password: str) -> None:
+    def __init__(self, uri: str, username: str, password: str, repo_id: str = "default") -> None:
         self._driver: Driver = GraphDatabase.driver(uri, auth=(username, password))
+        self._repo_id = repo_id
 
     def close(self) -> None:
         """Close the Neo4j driver."""
@@ -78,21 +79,25 @@ class RouteStitcher:
             route_calls_records = session.run(
                 """
                 MATCH (rc:RouteCall)
+                WHERE rc.repo_id = $repo_id
                 RETURN rc.path AS path,
                        rc.http_method AS http_method,
                        rc.source_method_fqn AS source_method_fqn,
                        rc.confidence AS confidence
-                """
+                """,
+                repo_id=self._repo_id,
             )
             route_calls = [dict(record) for record in route_calls_records]
 
             endpoints_records = session.run(
                 """
                 MATCH (e:Endpoint)
+                WHERE e.repo_id = $repo_id
                 RETURN e.path AS path,
                        e.http_method AS http_method,
                        e.handler_fqn AS handler_fqn
-                """
+                """,
+                repo_id=self._repo_id,
             )
             endpoints = [dict(record) for record in endpoints_records]
 
@@ -117,9 +122,10 @@ class RouteStitcher:
                         MATCH (rc:RouteCall {
                             path: $rc_path,
                             http_method: $http_method,
-                            source_method_fqn: $source_method_fqn
+                            source_method_fqn: $source_method_fqn,
+                            repo_id: $repo_id
                         })
-                        MATCH (e:Endpoint {path: $endpoint_path, http_method: $http_method})
+                        MATCH (e:Endpoint {path: $endpoint_path, http_method: $http_method, repo_id: $repo_id})
                         MERGE (rc)-[r:ROUTES_TO]->(e)
                         ON CREATE SET r._new = true
                         SET r.confidence = $confidence,
@@ -134,6 +140,7 @@ class RouteStitcher:
                         endpoint_path=str(endpoint.get("path", "")),
                         confidence=confidence,
                         match_type=match_type,
+                        repo_id=self._repo_id,
                     ).single()
                     created = bool(record["created"]) if record is not None else False
                     if created:
@@ -149,4 +156,3 @@ class RouteStitcher:
             unmatched_calls=unmatched_calls,
             total_edges_created=total_edges_created,
         )
-
